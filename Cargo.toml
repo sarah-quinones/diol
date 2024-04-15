@@ -2,6 +2,12 @@
 name = "diol"
 version = "0.1.0"
 edition = "2021"
+authors = ["sarah <>"]
+description = "benchmark lib"
+readme = "README.md"
+repository = "https://github.com/sarah-ek/diol/"
+license = "MIT"
+keywords = ["benchmark"]
 
 [dependencies]
 dyn-clone = "1.0.17"
