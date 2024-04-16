@@ -4,6 +4,7 @@ use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::element::PointCollection;
 use plotters::prelude::*;
 use plotters::style::full_palette::*;
+use regex::Regex;
 use serde::Deserialize;
 use std::any::TypeId;
 use std::fmt;
@@ -434,6 +435,8 @@ pub struct BenchConfig {
     pub plot_size: PlotSize,
     pub plot_axis: PlotAxis,
     pub plot_name: PlotName,
+    pub fn_regex: Option<Regex>,
+    pub arg_regex: Option<Regex>,
 }
 
 impl BenchConfig {
@@ -526,10 +529,25 @@ impl Bench {
 
         for (fns, args) in &self.fns {
             for (name, _) in fns {
+                if config
+                    .fn_regex
+                    .as_ref()
+                    .is_some_and(|regex| !regex.is_match(name))
+                {
+                    continue;
+                }
                 max_name_len = Ord::max(max_name_len, name.len());
             }
             for arg in args {
-                max_arg_len = Ord::max(max_arg_len, format!("{arg:?}").len());
+                let arg = &*format!("{arg:?}");
+                if config
+                    .arg_regex
+                    .as_ref()
+                    .is_some_and(|regex| !regex.is_match(arg))
+                {
+                    continue;
+                }
+                max_arg_len = Ord::max(max_arg_len, arg.len());
             }
         }
 
@@ -576,6 +594,14 @@ impl Bench {
             let args = &**args;
             for arg in args {
                 let arg_str = &*format!("{arg:?}");
+                if config
+                    .arg_regex
+                    .as_ref()
+                    .is_some_and(|regex| !regex.is_match(arg_str))
+                {
+                    continue;
+                }
+
                 if verbose && config.split == Split::ByArg {
                     println!(
                         "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
@@ -586,6 +612,14 @@ impl Bench {
                 let fn_count = fns.len();
                 for (idx, (name, f)) in fns.iter_mut().enumerate() {
                     let name = &**name;
+                    if config
+                        .fn_regex
+                        .as_ref()
+                        .is_some_and(|regex| !regex.is_match(name))
+                    {
+                        continue;
+                    }
+
                     let f = &mut **f;
                     let ctx = &mut BenchCtx {
                         timings: Vec::new(),
@@ -734,9 +768,10 @@ impl fmt::Debug for PlotArg {
 
 pub mod prelude {
     pub use super::{
-        list, unlist, Bench, BenchConfig, Bencher, Cons, ItersPerSample, MaxTime, MinTime, PlotArg,
-        PlotAxis, PlotName, PlotSize, SampleCount, Split, TerminalOutput,
+        list, unlist, Bench, BenchConfig, Bencher, Cons, ItersPerSample, List, MaxTime, MinTime,
+        PlotArg, PlotAxis, PlotName, PlotSize, SampleCount, Split, TerminalOutput,
     };
+    pub use regex::Regex;
 }
 
 #[cfg(test)]
