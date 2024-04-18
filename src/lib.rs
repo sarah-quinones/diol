@@ -1,16 +1,21 @@
+use clap::Parser;
 use dyn_clone::DynClone;
 use equator::assert;
-use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
-use plotters::element::PointCollection;
-use plotters::prelude::*;
-use plotters::style::full_palette::*;
+use plotters::{
+    coord::ranged1d::{AsRangedCoord, ValueFormatter},
+    element::PointCollection,
+    prelude::*,
+    style::full_palette::*,
+};
 use regex::Regex;
-use serde::Deserialize;
-use std::any::TypeId;
-use std::fmt;
-use std::path::PathBuf;
-use std::process::Command;
-use std::{any::Any, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    path::PathBuf,
+    process::Command,
+    time::Duration,
+};
 
 use traits::{Arg, Register};
 
@@ -150,7 +155,7 @@ macro_rules! List {
     };
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Picoseconds(pub i128);
 
 impl std::ops::Add for Picoseconds {
@@ -435,22 +440,100 @@ pub struct BenchConfig {
     pub plot_size: PlotSize,
     pub plot_axis: PlotAxis,
     pub plot_name: PlotName,
-    pub fn_regex: Option<Regex>,
-    pub arg_regex: Option<Regex>,
+    pub func_filter: Option<Regex>,
+    pub arg_filter: Option<Regex>,
+    pub output: Option<PathBuf>,
 }
 
 impl BenchConfig {
     pub fn new() -> Self {
         Default::default()
     }
+
+    pub fn from_args() -> Self {
+        let mut config = Self::default();
+
+        #[derive(Parser)]
+        struct Clap {
+            #[arg(long)]
+            bench: bool,
+
+            #[arg(long)]
+            sample_count: Option<u64>,
+
+            #[arg(long)]
+            min_time: Option<f64>,
+
+            #[arg(long)]
+            max_time: Option<f64>,
+
+            #[arg(long)]
+            quiet: bool,
+
+            #[arg(long)]
+            func_filter: Option<Regex>,
+
+            #[arg(long)]
+            arg_filter: Option<Regex>,
+
+            #[arg(long)]
+            output: Option<PathBuf>,
+        }
+
+        let clap = Clap::parse();
+        if let Some(sample_count) = clap.sample_count {
+            config.sample_count = SampleCount(sample_count)
+        }
+        if let Some(min_time) = clap.min_time {
+            config.min_time = MinTime(Duration::from_secs_f64(min_time))
+        }
+        if let Some(max_time) = clap.max_time {
+            config.max_time = MaxTime(Duration::from_secs_f64(max_time))
+        }
+        if let true = clap.quiet {
+            config.verbose = TerminalOutput::Quiet;
+        }
+        if let Some(func_filter) = clap.func_filter {
+            config.func_filter = Some(func_filter);
+        }
+        if let Some(arg_filter) = clap.arg_filter {
+            config.arg_filter = Some(arg_filter);
+        }
+        config.output = clap.output;
+
+        config
+    }
 }
 
 pub struct Bench {
     pub config: BenchConfig,
-    pub fns: Vec<(
+    pub groups: Vec<(
         Vec<(String, Box<dyn FnMut(Bencher, Box<dyn Arg>)>)>,
         Vec<Box<dyn Arg>>,
     )>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BenchArgs {
+    Named(Vec<String>),
+    Plot(Vec<PlotArg>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchFunctionResult {
+    pub name: String,
+    pub timings: Vec<Vec<Picoseconds>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchGroupResult {
+    pub function: Vec<BenchFunctionResult>,
+    pub args: BenchArgs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchResult {
+    pub groups: Vec<BenchGroupResult>,
 }
 
 impl<T> traits::Register<T> for Nil {
@@ -476,11 +559,17 @@ impl<T: Arg, Head: 'static + FnMut(Bencher, T), Tail: traits::Register<T>> trait
     }
 }
 
+impl AsRef<BenchConfig> for BenchConfig {
+    fn as_ref(&self) -> &BenchConfig {
+        self
+    }
+}
+
 impl Bench {
-    pub fn new(config: BenchConfig) -> Self {
+    pub fn new(config: impl AsRef<BenchConfig>) -> Self {
         Self {
-            config,
-            fns: Vec::new(),
+            config: config.as_ref().clone(),
+            groups: Vec::new(),
         }
     }
 
@@ -493,7 +582,7 @@ impl Bench {
         let mut boxed = Vec::new();
         traits::Register::push_self(f, &mut boxed);
 
-        self.fns.push((
+        self.groups.push((
             std::iter::zip(names, boxed).collect(),
             args.into_iter()
                 .map(|arg| Box::new(arg) as Box<dyn Arg>)
@@ -520,17 +609,18 @@ impl Bench {
         self.register_many_with_names(vec![name.as_ref().to_string()], list![f], args)
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> BenchResult {
         let config = &self.config;
         let plot_name = &config.plot_name.0;
+        let mut result = BenchResult { groups: Vec::new() };
 
         let mut max_name_len = 14;
         let mut max_arg_len = 4;
 
-        for (fns, args) in &self.fns {
+        for (fns, args) in &self.groups {
             for (name, _) in fns {
                 if config
-                    .fn_regex
+                    .func_filter
                     .as_ref()
                     .is_some_and(|regex| !regex.is_match(name))
                 {
@@ -541,7 +631,7 @@ impl Bench {
             for arg in args {
                 let arg = &*format!("{arg:?}");
                 if config
-                    .arg_regex
+                    .arg_filter
                     .as_ref()
                     .is_some_and(|regex| !regex.is_match(arg))
                 {
@@ -568,21 +658,35 @@ impl Bench {
 
         let mut plot_id = 0;
 
-        for (fns, args) in &mut self.fns {
+        for (group, args) in &mut self.groups {
+            let mut group_function_result = Vec::new();
+            let mut group_arg_named = Vec::new();
+            let mut group_arg_plot = Vec::new();
+
             let target = cargo_target_directory()
                 .unwrap()
                 .join(format!("{plot_name}_{plot_id}.svg"));
             let mut max_arg = 0usize;
             let mut min_arg = usize::MAX;
             let mut max_time = Picoseconds(0);
-            let mut lines = vec![(RGBAColor(0, 0, 0, 1.0), String::new(), Vec::new()); fns.len()];
+            let mut lines = vec![(RGBAColor(0, 0, 0, 1.0), String::new(), Vec::new()); group.len()];
 
             for arg in &**args {
                 if (**arg).type_id() == TypeId::of::<PlotArg>() {
                     let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
                     max_arg = Ord::max(arg.0, max_arg);
                     min_arg = Ord::min(arg.0, min_arg);
+                    group_arg_plot.push(*arg);
+                } else {
+                    let arg = &**arg;
+                    group_arg_named.push(format!("{arg:?}"));
                 }
+            }
+            for (name, _) in &**group {
+                group_function_result.push(BenchFunctionResult {
+                    name: name.to_string(),
+                    timings: vec![Vec::new(); args.len()],
+                })
             }
 
             if verbose && matches!(config.split, Split::ByGroup | Split::ByArg) {
@@ -592,10 +696,10 @@ impl Bench {
                 );
             }
             let args = &**args;
-            for arg in args {
+            for (arg_idx, arg) in args.iter().enumerate() {
                 let arg_str = &*format!("{arg:?}");
                 if config
-                    .arg_regex
+                    .arg_filter
                     .as_ref()
                     .is_some_and(|regex| !regex.is_match(arg_str))
                 {
@@ -609,11 +713,11 @@ impl Bench {
                     );
                 }
 
-                let fn_count = fns.len();
-                for (idx, (name, f)) in fns.iter_mut().enumerate() {
+                let fn_count = group.len();
+                for (idx, (name, f)) in group.iter_mut().enumerate() {
                     let name = &**name;
                     if config
-                        .fn_regex
+                        .func_filter
                         .as_ref()
                         .is_some_and(|regex| !regex.is_match(name))
                     {
@@ -621,10 +725,16 @@ impl Bench {
                     }
 
                     let f = &mut **f;
-                    let ctx = &mut BenchCtx {
+                    let mut ctx = BenchCtx {
                         timings: Vec::new(),
                     };
-                    f(Bencher { ctx, config }, dyn_clone::clone_box(&**arg));
+                    f(
+                        Bencher {
+                            ctx: &mut ctx,
+                            config,
+                        },
+                        dyn_clone::clone_box(&**arg),
+                    );
                     ctx.timings.sort_unstable();
                     let count = ctx.timings.len();
 
@@ -670,6 +780,8 @@ impl Bench {
                             );
                         }
                     }
+
+                    group_function_result[idx].timings[arg_idx] = ctx.timings;
                 }
             }
 
@@ -705,6 +817,18 @@ impl Bench {
 
                 root.present().unwrap();
             }
+
+            if group_arg_plot.len() > 0 {
+                result.groups.push(BenchGroupResult {
+                    function: group_function_result,
+                    args: BenchArgs::Plot(group_arg_plot),
+                });
+            } else {
+                result.groups.push(BenchGroupResult {
+                    function: group_function_result,
+                    args: BenchArgs::Named(group_arg_named),
+                });
+            }
         }
 
         if verbose {
@@ -713,6 +837,12 @@ impl Bench {
                 "", "", "", "", "", "",
             );
         }
+        if let Some(path) = &config.output {
+            let file = std::fs::File::create(path).unwrap();
+            serde_json::ser::to_writer(file, &result).unwrap();
+        }
+
+        result
     }
 }
 
@@ -757,7 +887,7 @@ fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
         .unwrap();
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlotArg(pub usize);
 
 impl fmt::Debug for PlotArg {
