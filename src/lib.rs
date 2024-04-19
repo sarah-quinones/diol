@@ -999,7 +999,8 @@ impl fmt::Debug for PlotArg {
 pub mod prelude {
     pub use super::{
         list, unlist, Bench, BenchConfig, Bencher, Cons, ItersPerSample, List, MaxTime, MinTime,
-        PlotArg, PlotAxis, PlotName, PlotSize, SampleCount, Split, TerminalOutput,
+        PlotArg, PlotAxis, PlotDir, PlotMetric, PlotName, PlotSize, SampleCount, Split,
+        TerminalOutput,
     };
     pub use regex::Regex;
 }
