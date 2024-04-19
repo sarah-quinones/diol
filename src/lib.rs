@@ -90,6 +90,19 @@ pub mod traits {
         fn push_self(this: Self, boxed: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>);
     }
 
+    pub trait PlotMetric: DynClone {
+        fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64;
+        fn name(&self) -> &'static str {
+            std::any::type_name::<Self>().split("::").last().unwrap()
+        }
+    }
+
+    impl<T: DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
+        fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64 {
+            self(arg, time)
+        }
+    }
+
     impl<T: Any + fmt::Debug + DynClone> Arg for T {}
 }
 
@@ -258,7 +271,7 @@ pub struct Bencher<'a> {
 }
 
 #[inline]
-fn time(f: &mut impl FnMut(), iters_per_sample: u64) -> Duration {
+fn measure_time(f: &mut impl FnMut(), iters_per_sample: u64) -> Duration {
     let now = std::time::Instant::now();
     for _ in 0..iters_per_sample {
         f();
@@ -284,7 +297,7 @@ impl Bencher<'_> {
                 let mut done = false;
 
                 loop {
-                    let time = time(f, iters_per_sample);
+                    let time = measure_time(f, iters_per_sample);
                     if time > self.config.max_time.0 {
                         self.ctx.timings.push(Picoseconds(
                             (time.as_nanos() as i128 * 1000) / iters_per_sample as i128,
@@ -312,7 +325,7 @@ impl Bencher<'_> {
     fn do_bench(self, f: &mut impl FnMut(), iters_per_sample: u64) {
         let mut total_time = Duration::ZERO;
         for _ in 0..self.config.sample_count.0 {
-            let time = time(f, iters_per_sample);
+            let time = measure_time(f, iters_per_sample);
             self.ctx.timings.push(Picoseconds(
                 (time.as_nanos() as i128 * 1000) / iters_per_sample as i128,
             ));
@@ -323,7 +336,7 @@ impl Bencher<'_> {
             }
         }
         while total_time < self.config.min_time.0 {
-            let time = time(f, iters_per_sample);
+            let time = measure_time(f, iters_per_sample);
             self.ctx.timings.push(Picoseconds(
                 (time.as_nanos() as i128 * 1000) / iters_per_sample as i128,
             ));
@@ -352,6 +365,37 @@ pub enum PlotAxis {
     SemiLogX,
     SemiLogY,
     LogLog,
+}
+
+pub struct PlotMetric(pub Box<dyn traits::PlotMetric>);
+#[derive(Clone, Debug)]
+pub struct PlotDir(pub Option<PathBuf>);
+
+impl Default for PlotDir {
+    fn default() -> Self {
+        Self(cargo_target_directory())
+    }
+}
+
+impl Clone for PlotMetric {
+    fn clone(&self) -> Self {
+        Self(dyn_clone::clone_box(&*self.0))
+    }
+}
+
+impl fmt::Debug for PlotMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PlotMetric").field(&self.0.name()).finish()
+    }
+}
+
+impl Default for PlotMetric {
+    fn default() -> Self {
+        fn time(_: PlotArg, time: Picoseconds) -> f64 {
+            time.0 as f64 / 1e12
+        }
+        Self(Box::new(time))
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -440,6 +484,8 @@ pub struct BenchConfig {
     pub plot_size: PlotSize,
     pub plot_axis: PlotAxis,
     pub plot_name: PlotName,
+    pub plot_metric: PlotMetric,
+    pub plot_dir: PlotDir,
     pub func_filter: Option<Regex>,
     pub arg_filter: Option<Regex>,
     pub output: Option<PathBuf>,
@@ -478,6 +524,9 @@ impl BenchConfig {
 
             #[arg(long)]
             output: Option<PathBuf>,
+
+            #[arg(long)]
+            plot_dir: Option<PathBuf>,
         }
 
         let clap = Clap::parse();
@@ -498,6 +547,9 @@ impl BenchConfig {
         }
         if let Some(arg_filter) = clap.arg_filter {
             config.arg_filter = Some(arg_filter);
+        }
+        if let Some(plot_dir) = clap.plot_dir {
+            config.plot_dir = PlotDir(Some(plot_dir));
         }
         config.output = clap.output;
 
@@ -523,6 +575,7 @@ pub enum BenchArgs {
 pub struct BenchFunctionResult {
     pub name: String,
     pub timings: Vec<Vec<Picoseconds>>,
+    pub metric: Option<(String, Vec<f64>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,7 +630,7 @@ impl Bench {
         &mut self,
         names: Vec<String>,
         f: F,
-        args: Vec<T>,
+        args: impl IntoIterator<Item = T>,
     ) {
         let mut boxed = Vec::new();
         traits::Register::push_self(f, &mut boxed);
@@ -590,13 +643,21 @@ impl Bench {
         ));
     }
 
-    pub fn register_many<T: Arg>(&mut self, f: impl Register<T>, args: Vec<T>) {
+    pub fn register_many<T: Arg>(
+        &mut self,
+        f: impl Register<T>,
+        args: impl IntoIterator<Item = T>,
+    ) {
         let mut names = Vec::new();
         Register::push_name(&f, &mut names);
         self.register_many_with_names(names, f, args);
     }
 
-    pub fn register<T: Arg>(&mut self, f: impl 'static + FnMut(Bencher, T), args: Vec<T>) {
+    pub fn register<T: Arg>(
+        &mut self,
+        f: impl 'static + FnMut(Bencher, T),
+        args: impl IntoIterator<Item = T>,
+    ) {
         self.register_many(list![f], args)
     }
 
@@ -604,7 +665,7 @@ impl Bench {
         &mut self,
         name: impl AsRef<str>,
         f: impl 'static + FnMut(Bencher, T),
-        args: Vec<T>,
+        args: impl IntoIterator<Item = T>,
     ) {
         self.register_many_with_names(vec![name.as_ref().to_string()], list![f], args)
     }
@@ -663,12 +724,14 @@ impl Bench {
             let mut group_arg_named = Vec::new();
             let mut group_arg_plot = Vec::new();
 
-            let target = cargo_target_directory()
-                .unwrap()
-                .join(format!("{plot_name}_{plot_id}.svg"));
+            let plot_target = config
+                .plot_dir
+                .0
+                .as_ref()
+                .map(|dir| dir.join(format!("{plot_name}_{plot_id}.svg")));
             let mut max_arg = 0usize;
             let mut min_arg = usize::MAX;
-            let mut max_time = Picoseconds(0);
+            let mut max_y = 0.0f64;
             let mut lines = vec![(RGBAColor(0, 0, 0, 1.0), String::new(), Vec::new()); group.len()];
 
             for arg in &**args {
@@ -686,6 +749,14 @@ impl Bench {
                 group_function_result.push(BenchFunctionResult {
                     name: name.to_string(),
                     timings: vec![Vec::new(); args.len()],
+                    metric: if max_arg > 0 {
+                        Some((
+                            config.plot_metric.0.name().to_string(),
+                            vec![0.0; args.len()],
+                        ))
+                    } else {
+                        None
+                    },
                 })
             }
 
@@ -736,6 +807,7 @@ impl Bench {
                         dyn_clone::clone_box(&**arg),
                     );
                     ctx.timings.sort_unstable();
+                    let mut metric = 0.0;
                     let count = ctx.timings.len();
 
                     if count > 0 {
@@ -761,8 +833,16 @@ impl Bench {
 
                         if max_arg > 0 {
                             assert!((**arg).type_id() == TypeId::of::<PlotArg>());
+
                             let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
-                            max_time = Ord::max(max_time, fastest);
+                            metric = ctx
+                                .timings
+                                .iter()
+                                .map(|time| config.plot_metric.0.compute(*arg, *time))
+                                .sum::<f64>()
+                                / count as f64;
+
+                            max_y = f64::max(max_y, metric);
                             lines[idx].0 = ViridisRGBA::get_color(if fn_count == 0 {
                                 0.5
                             } else {
@@ -771,7 +851,7 @@ impl Bench {
                             if lines[idx].1.is_empty() {
                                 lines[idx].1 = name.to_string();
                             }
-                            lines[idx].2.push((arg.0, fastest));
+                            lines[idx].2.push((arg.0, metric));
                         }
 
                         if verbose {
@@ -782,40 +862,59 @@ impl Bench {
                     }
 
                     group_function_result[idx].timings[arg_idx] = ctx.timings;
+                    if let Some(metrics) = &mut group_function_result[idx].metric {
+                        metrics.1[arg_idx] = metric;
+                    }
                 }
             }
 
-            if max_arg > 0 {
-                let root = SVGBackend::new(&target, (config.plot_size.x, config.plot_size.y))
-                    .into_drawing_area();
-                root.fill(&GREY_300).unwrap();
-                let mut builder = ChartBuilder::on(&root);
-                builder
-                    .margin(30)
-                    .x_label_area_size(30)
-                    .y_label_area_size(30);
+            if let Some(plot_target) = &plot_target {
+                if max_arg > 0 {
+                    let root =
+                        SVGBackend::new(plot_target, (config.plot_size.x, config.plot_size.y))
+                            .into_drawing_area();
+                    root.fill(&GREY_300).unwrap();
+                    let mut builder = ChartBuilder::on(&root);
+                    builder
+                        .margin(30)
+                        .x_label_area_size(30)
+                        .y_label_area_size(30);
 
-                let xrange = min_arg as f32..max_arg as f32;
-                let yrange = 0.0f32..max_time.0 as f32 / 1e12;
+                    let xrange = min_arg as f32..max_arg as f32;
+                    let yrange = 0.0f32..max_y as f32;
 
-                match config.plot_axis {
-                    PlotAxis::Linear => do_plot(builder, xrange, yrange, &mut plot_id, lines),
-                    PlotAxis::SemiLogX => {
-                        do_plot(builder, xrange.log_scale(), yrange, &mut plot_id, lines)
+                    match config.plot_axis {
+                        PlotAxis::Linear => {
+                            do_plot(config, builder, xrange, yrange, &mut plot_id, lines)
+                        }
+                        PlotAxis::SemiLogX => do_plot(
+                            config,
+                            builder,
+                            xrange.log_scale(),
+                            yrange,
+                            &mut plot_id,
+                            lines,
+                        ),
+                        PlotAxis::SemiLogY => do_plot(
+                            config,
+                            builder,
+                            xrange,
+                            yrange.log_scale(),
+                            &mut plot_id,
+                            lines,
+                        ),
+                        PlotAxis::LogLog => do_plot(
+                            config,
+                            builder,
+                            xrange.log_scale(),
+                            yrange.log_scale(),
+                            &mut plot_id,
+                            lines,
+                        ),
                     }
-                    PlotAxis::SemiLogY => {
-                        do_plot(builder, xrange, yrange.log_scale(), &mut plot_id, lines)
-                    }
-                    PlotAxis::LogLog => do_plot(
-                        builder,
-                        xrange.log_scale(),
-                        yrange.log_scale(),
-                        &mut plot_id,
-                        lines,
-                    ),
+
+                    root.present().unwrap();
                 }
-
-                root.present().unwrap();
             }
 
             if group_arg_plot.len() > 0 {
@@ -847,11 +946,12 @@ impl Bench {
 }
 
 fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
+    _: &BenchConfig,
     mut builder: ChartBuilder<'_, '_, SVGBackend<'a>>,
     xrange: X,
     yrange: Y,
     plot_id: &mut i32,
-    lines: Vec<(RGBAColor, String, Vec<(usize, Picoseconds)>)>,
+    lines: Vec<(RGBAColor, String, Vec<(usize, f64)>)>,
 ) where
     X::CoordDescType: ValueFormatter<X::Value>,
     Y::CoordDescType: ValueFormatter<Y::Value>,
@@ -870,17 +970,17 @@ fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
         };
         chart
             .draw_series(LineSeries::new(
-                line.iter()
-                    .map(|&(n, time)| (n as f32, time.0 as f32 / 1e12)),
+                line.iter().map(|&(n, metric)| (n as f32, metric as f32)),
                 style,
             ))
             .unwrap()
             .label(name)
-            .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], style));
+            .legend(move |(x, y)| PathElement::new(vec![(x + 20, y), (x, y)], style));
     }
 
     chart
         .configure_series_labels()
+        .position(SeriesLabelPosition::UpperLeft)
         .background_style(&GREY_A100.mix(0.8))
         .border_style(&full_palette::BLACK)
         .draw()
@@ -940,10 +1040,7 @@ mod tests {
             ..Default::default()
         });
         println!();
-        bench.register_many(
-            list![naive, popcnt],
-            (0..20).map(|i| 1 << i).map(PlotArg).collect(),
-        );
+        bench.register_many(list![naive, popcnt], (0..20).map(|i| 1 << i).map(PlotArg));
         bench.run();
     }
 }
