@@ -1,6 +1,6 @@
 [package]
 name = "diol"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 authors = ["sarah <>"]
 description = "benchmark lib"
@@ -14,9 +14,12 @@ clap = { version = "4.5.4", features = ["derive"] }
 dyn-clone = "1.0.17"
 equator = "0.2.0"
 plotters = "0.3.5"
+prettyplease = "0.2.19"
+quote = "1.0.36"
 regex = "1.10.4"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
+syn = { version = "2.0.60", features = ["extra-traits"] }
 
 [dev-dependencies]
 popcnt = "0.1.0"

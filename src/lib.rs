@@ -368,6 +368,7 @@ pub enum PlotAxis {
 }
 
 pub struct PlotMetric(pub Box<dyn traits::PlotMetric>);
+
 #[derive(Clone, Debug)]
 pub struct PlotDir(pub Option<PathBuf>);
 
@@ -398,6 +399,12 @@ impl Default for PlotMetric {
     }
 }
 
+impl PlotMetric {
+    pub fn new(metric: impl 'static + traits::PlotMetric) -> Self {
+        Self(Box::new(metric))
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ItersPerSample {
     Auto,
@@ -414,13 +421,6 @@ pub struct MaxTime(pub Duration);
 pub enum TerminalOutput {
     Quiet,
     Verbose,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Split {
-    None,
-    ByGroup,
-    ByArg,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,12 +455,6 @@ impl Default for TerminalOutput {
     }
 }
 
-impl Default for Split {
-    fn default() -> Self {
-        Self::ByGroup
-    }
-}
-
 impl Default for PlotSize {
     fn default() -> Self {
         Self { x: 640, y: 400 }
@@ -480,7 +474,6 @@ pub struct BenchConfig {
     pub min_time: MinTime,
     pub max_time: MaxTime,
     pub verbose: TerminalOutput,
-    pub split: Split,
     pub plot_size: PlotSize,
     pub plot_axis: PlotAxis,
     pub plot_name: PlotName,
@@ -594,11 +587,119 @@ impl<T> traits::Register<T> for Nil {
     fn push_self(_: Self, _: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>) {}
 }
 
+fn minify_path_segment(segment: &mut syn::PathSegment) {
+    match &mut segment.arguments {
+        syn::PathArguments::None => {}
+        syn::PathArguments::AngleBracketed(t) => {
+            for arg in &mut t.args {
+                match arg {
+                    syn::GenericArgument::Lifetime(_) => {}
+                    syn::GenericArgument::Type(t) => minify_ty(t),
+                    syn::GenericArgument::Const(_) => {}
+                    syn::GenericArgument::AssocType(t) => {
+                        minify_ty(&mut t.ty);
+                    }
+                    syn::GenericArgument::AssocConst(_) => {}
+                    syn::GenericArgument::Constraint(_) => {}
+                    _ => {}
+                }
+            }
+        }
+        syn::PathArguments::Parenthesized(t) => {
+            for t in &mut t.inputs {
+                minify_ty(t);
+            }
+            match &mut t.output {
+                syn::ReturnType::Default => {}
+                syn::ReturnType::Type(_, t) => {
+                    minify_ty(t);
+                }
+            }
+        }
+    }
+}
+
+fn minify_bound(bound: &mut syn::TypeParamBound) {
+    match bound {
+        syn::TypeParamBound::Trait(t) => {
+            t.path.leading_colon = None;
+            if let Some(last) = t.path.segments.pop() {
+                let mut last = last.into_value();
+                minify_path_segment(&mut last);
+                t.path.segments.clear();
+                t.path.segments.push_value(last);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn minify_ty(ty: &mut syn::Type) {
+    use syn::Type;
+    match ty {
+        Type::Array(t) => minify_ty(&mut t.elem),
+        Type::BareFn(t) => {
+            for arg in &mut t.inputs {
+                minify_ty(&mut arg.ty);
+            }
+            if let syn::ReturnType::Type(_, ty) = &mut t.output {
+                minify_ty(ty);
+            }
+        }
+        Type::Group(t) => minify_ty(&mut t.elem),
+        Type::ImplTrait(t) => {
+            for bound in &mut t.bounds {
+                minify_bound(bound);
+            }
+        }
+
+        Type::Infer(_) => {}
+        Type::Macro(_) => {}
+        Type::Never(_) => {}
+        Type::Paren(_) => {}
+        Type::Path(t) => {
+            if let Some(last) = t.path.segments.pop() {
+                let mut last = last.into_value();
+                minify_path_segment(&mut last);
+                t.path.segments.clear();
+                t.path.segments.push_value(last);
+            }
+        }
+        Type::Ptr(t) => minify_ty(&mut t.elem),
+        Type::Reference(t) => minify_ty(&mut t.elem),
+        Type::Slice(t) => minify_ty(&mut t.elem),
+        Type::TraitObject(t) => {
+            for bound in &mut t.bounds {
+                minify_bound(bound);
+            }
+        }
+        Type::Tuple(t) => {
+            for t in &mut t.elems {
+                minify_ty(t);
+            }
+        }
+        Type::Verbatim(_) => {}
+        _ => {}
+    };
+}
+
 impl<T: Arg, Head: 'static + FnMut(Bencher, T), Tail: traits::Register<T>> traits::Register<T>
     for Cons<Head, Tail>
 {
     fn push_name(this: &Self, names: &mut Vec<String>) {
-        names.push(std::any::type_name_of_val(&this.head).to_string());
+        let name = std::any::type_name::<Head>();
+        if let Ok(mut ty) = syn::parse_str::<syn::Type>(name) {
+            minify_ty(&mut ty);
+            let file = syn::parse2::<syn::File>(quote::quote! { type X = [#ty]; }).unwrap();
+            let file = prettyplease::unparse(&file);
+            let mut file = &*file;
+            file = &file[file.find("[").unwrap() + 1..];
+            file = &file[..file.rfind("]").unwrap()];
+            names.push(format!("{}", file));
+        } else {
+            names.push(name.to_string());
+        }
+
         Tail::push_name(&this.tail, names);
     }
     fn push_self(this: Self, boxed: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>) {
@@ -670,7 +771,7 @@ impl Bench {
         self.register_many_with_names(vec![name.as_ref().to_string()], list![f], args)
     }
 
-    pub fn run(&mut self) -> BenchResult {
+    pub fn run(&mut self) -> std::io::Result<BenchResult> {
         let config = &self.config;
         let plot_name = &config.plot_name.0;
         let mut result = BenchResult { groups: Vec::new() };
@@ -706,20 +807,21 @@ impl Bench {
         max_arg_len += 1;
 
         let verbose = config.verbose == TerminalOutput::Verbose;
-        if verbose {
-            println!(
-                "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
-                "", "", "", "", "", "",
-            );
-            println!(
-                "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
-                "benchmark", "args", "fastest", "median", "mean", "stddev",
-            );
-        }
 
         let mut plot_id = 0;
 
         for (group, args) in &mut self.groups {
+            if verbose {
+                println!(
+                    "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
+                    "", "", "", "", "", "",
+                );
+                println!(
+                    "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
+                    "benchmark", "args", "fastest", "median", "mean", "stddev",
+                );
+            }
+
             let mut group_function_result = Vec::new();
             let mut group_arg_named = Vec::new();
             let mut group_arg_plot = Vec::new();
@@ -760,12 +862,6 @@ impl Bench {
                 })
             }
 
-            if verbose && matches!(config.split, Split::ByGroup | Split::ByArg) {
-                println!(
-                    "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
-                    "", "", "", "", "", "",
-                );
-            }
             let args = &**args;
             for (arg_idx, arg) in args.iter().enumerate() {
                 let arg_str = &*format!("{arg:?}");
@@ -777,7 +873,24 @@ impl Bench {
                     continue;
                 }
 
-                if verbose && config.split == Split::ByArg {
+                let mut func_count = 0usize;
+
+                for (name, _) in group.iter() {
+                    let name = &**name;
+                    if config
+                        .func_filter
+                        .as_ref()
+                        .is_some_and(|regex| !regex.is_match(name))
+                    {
+                        continue;
+                    }
+                    func_count += 1;
+                }
+                if func_count == 0 {
+                    continue;
+                }
+
+                if verbose {
                     println!(
                         "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
                         "", "", "", "", "", "",
@@ -928,20 +1041,20 @@ impl Bench {
                     args: BenchArgs::Named(group_arg_named),
                 });
             }
+            if verbose {
+                println!(
+                    "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
+                    "", "", "", "", "", "",
+                );
+            }
         }
 
-        if verbose {
-            println!(
-                "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
-                "", "", "", "", "", "",
-            );
-        }
         if let Some(path) = &config.output {
-            let file = std::fs::File::create(path).unwrap();
-            serde_json::ser::to_writer(file, &result).unwrap();
+            let file = std::fs::File::create(path)?;
+            serde_json::ser::to_writer(std::io::BufWriter::new(file), &result)?;
         }
 
-        result
+        Ok(result)
     }
 }
 
@@ -999,8 +1112,7 @@ impl fmt::Debug for PlotArg {
 pub mod prelude {
     pub use super::{
         list, unlist, Bench, BenchConfig, Bencher, Cons, ItersPerSample, List, MaxTime, MinTime,
-        PlotArg, PlotAxis, PlotDir, PlotMetric, PlotName, PlotSize, SampleCount, Split,
-        TerminalOutput,
+        PlotArg, PlotAxis, PlotDir, PlotMetric, PlotName, PlotSize, SampleCount, TerminalOutput,
     };
     pub use regex::Regex;
 }
@@ -1026,7 +1138,9 @@ mod tests {
         })
     }
 
-    fn popcnt(bencher: Bencher, PlotArg(n): PlotArg) {
+    struct S;
+
+    fn popcnt<T>(bencher: Bencher, PlotArg(n): PlotArg) {
         let bytes = vec![1u8; n];
         bencher.bench(|| popcnt::count_ones(&bytes))
     }
@@ -1034,14 +1148,16 @@ mod tests {
     #[test]
     fn test_bench() {
         let mut bench = Bench::new(BenchConfig {
-            split: Split::ByArg,
             plot_axis: PlotAxis::LogLog,
             min_time: MinTime(Duration::from_millis(100)),
             max_time: MaxTime(Duration::from_millis(100)),
             ..Default::default()
         });
         println!();
-        bench.register_many(list![naive, popcnt], (0..20).map(|i| 1 << i).map(PlotArg));
-        bench.run();
+        bench.register_many(
+            list![naive, popcnt::<S>],
+            (0..20).map(|i| 1 << i).map(PlotArg),
+        );
+        bench.run().unwrap();
     }
 }
