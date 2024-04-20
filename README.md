@@ -46,10 +46,10 @@ benchmarks you can also pass in benchmark options using `cargo bench --bench my_
 ╰─────────────────┴──────┴───────────┴───────────┴───────────┴───────────╯
 ```
 
-# Dependencies
+# dependencies
 
-The plotters dependency requires the `pkg-config`, `freetype` and `fontconfig`.  
-To install on Ubuntu, you can use the following command.
+the plotters dependency requires the `pkg-config`, `freetype` and `fontconfig`.  
+to install on Ubuntu, you can use the following command.
 
 ```
 sudo apt install pkg-config libfreetype6-dev libfontconfig1-dev
