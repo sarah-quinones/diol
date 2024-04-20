@@ -1,3 +1,57 @@
+//! `diol` is a benchmarking library for rust.
+//!
+//! # getting started
+//! add the following to your `Cargo.toml`.
+//! ```notcode
+//! [dev-dependencies]
+//! diol = "0.6.0"
+//!
+//! [[bench]]
+//! name = "my_benchmark"
+//! harness = false
+//! ```
+//! then in `benches/my_benchmark.rs`.
+//!
+//! ```rust
+//! use diol::prelude::*;
+//!
+//! fn main() -> std::io::Result<()> {
+//!     let mut bench = Bench::new(BenchConfig::from_args());
+//!     bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
+//!     bench.run()?;
+//!     Ok(())
+//! }
+//!
+//! fn slice_times_two(bencher: Bencher, len: usize) {
+//!     let mut v = vec![0.0_f64; len];
+//!     bencher.bench(|| {
+//!         for x in &mut v {
+//!             *x *= 2.0;
+//!         }
+//!         black_box(&mut v);
+//!     });
+//! }
+//! ```
+//!
+//! run the benchmark with `cargo bench`, or `cargo bench --bench my_benchmark` if you have multiple
+//! benchmarks you can also pass in benchmark options using `cargo bench --bench my_benchmark --
+//! [OPTIONS...]`
+//!
+//! ```notcode
+//! ╭─────────────────┬──────┬───────────┬───────────┬───────────┬───────────╮
+//! │ benchmark       │ args │   fastest │    median │      mean │    stddev │
+//! ├─────────────────┼──────┼───────────┼───────────┼───────────┼───────────┤
+//! │ slice_times_two │    4 │  29.61 ns │  34.38 ns │  34.83 ns │   1.62 ns │
+//! ├─────────────────┼──────┼───────────┼───────────┼───────────┼───────────┤
+//! │ slice_times_two │    8 │  44.17 ns │  53.04 ns │  53.32 ns │   3.25 ns │
+//! ├─────────────────┼──────┼───────────┼───────────┼───────────┼───────────┤
+//! │ slice_times_two │   16 │  93.66 ns │ 107.91 ns │ 108.13 ns │   4.11 ns │
+//! ├─────────────────┼──────┼───────────┼───────────┼───────────┼───────────┤
+//! │ slice_times_two │  128 │ 489.97 ns │ 583.59 ns │ 585.28 ns │  33.15 ns │
+//! ├─────────────────┼──────┼───────────┼───────────┼───────────┼───────────┤
+//! │ slice_times_two │ 1024 │   3.77 µs │   4.51 µs │   4.53 µs │ 173.44 ns │
+//! ╰─────────────────┴──────┴───────────┴───────────┴───────────┴───────────╯
+//! ```
 use clap::Parser;
 use dyn_clone::DynClone;
 use equator::assert;
@@ -12,12 +66,16 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::{Any, TypeId},
     fmt,
+    io::Write,
     path::PathBuf,
     process::Command,
     time::Duration,
 };
 
-use traits::{Arg, Register};
+use config::*;
+use result::*;
+use traits::{Arg, Register, RegisterMany};
+use variadics::{Cons, Nil};
 
 // taken from criterion
 fn cargo_target_directory() -> Option<PathBuf> {
@@ -40,7 +98,7 @@ fn cargo_target_directory() -> Option<PathBuf> {
 }
 
 // taken from the stdlib
-pub const fn isqrt(this: u128) -> u128 {
+const fn isqrt(this: u128) -> u128 {
     if this < 2 {
         return this;
     }
@@ -67,52 +125,113 @@ pub const fn isqrt(this: u128) -> u128 {
     res
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Nil;
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Cons<Head, Tail> {
-    pub head: Head,
-    pub tail: Tail,
+trait DebugList {
+    fn push_debug(this: &Self, debug: &mut fmt::DebugList<'_, '_>);
 }
 
+/// helper traits and types
 pub mod traits {
     use super::*;
 
-    pub trait DebugList {
-        fn push_debug(this: &Self, debug: &mut fmt::DebugList<'_, '_>);
-    }
+    /// boxed `Register` trait object.
+    pub struct DynRegister<T>(pub Box<dyn Register<T>>);
 
+    /// type that can be used as a benchmark argument.
     pub trait Arg: Any + fmt::Debug + DynClone {}
 
-    pub trait Register<T> {
-        fn push_name(this: &Self, names: &mut Vec<String>);
-        fn push_self(this: Self, boxed: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>);
+    /// type that can be registered as a benchmark function.
+    pub trait Register<T>: 'static {
+        fn get_name(&self) -> String;
+        fn call_mut(&mut self, bencher: Bencher, arg: T);
     }
 
-    pub trait PlotMetric: DynClone {
+    /// [`Register`] extension trait.
+    pub trait RegisterExt<T>: Register<T> + Sized {
+        fn boxed(self) -> DynRegister<T> {
+            DynRegister(Box::new(self))
+        }
+        fn with_name(self, name: impl AsRef<str>) -> impl Register<T> {
+            fn implementation<T, F: Register<T>>(this: F, name: &str) -> impl Register<T> {
+                struct Named<F>(String, F);
+                impl<T, F: Register<T>> Register<T> for Named<F> {
+                    fn get_name(&self) -> String {
+                        self.0.clone()
+                    }
+
+                    fn call_mut(&mut self, bencher: Bencher, arg: T) {
+                        self.1.call_mut(bencher, arg)
+                    }
+                }
+
+                Named(name.to_string(), this)
+            }
+
+            implementation(self, name.as_ref())
+        }
+    }
+
+    impl<T, F: Register<T>> RegisterExt<T> for F {}
+    impl<T: Arg> Register<T> for DynRegister<T> {
+        fn get_name(&self) -> String {
+            (*self.0).get_name()
+        }
+
+        fn call_mut(&mut self, bencher: Bencher, arg: T) {
+            (*self.0).call_mut(bencher, arg)
+        }
+    }
+
+    impl<T, F: FnMut(Bencher, T) + 'static> Register<T> for F {
+        fn get_name(&self) -> String {
+            let name = std::any::type_name::<Self>();
+            if let Ok(mut ty) = syn::parse_str::<syn::Type>(name) {
+                minify_ty(&mut ty);
+                let file = syn::parse2::<syn::File>(quote::quote! { type X = [#ty]; }).unwrap();
+                let file = prettyplease::unparse(&file);
+                let mut file = &*file;
+                file = &file[file.find("[").unwrap() + 1..];
+                file = &file[..file.rfind("]").unwrap()];
+                format!("{}", file)
+            } else {
+                name.to_string()
+            }
+        }
+
+        fn call_mut(&mut self, bencher: Bencher, arg: T) {
+            (*self)(bencher, arg)
+        }
+    }
+
+    /// variadic tuple of types that can be registered as benchmark functions.
+    pub trait RegisterMany<T> {
+        fn push_name(this: &Self, names: &mut Vec<String>);
+        fn push_self(this: Self, boxed: &mut Vec<Box<dyn Register<Box<dyn Arg>>>>);
+    }
+
+    /// type that can be used as a metric for plots.
+    pub trait PlotMetric: DynClone + 'static {
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64;
         fn name(&self) -> &'static str {
             std::any::type_name::<Self>().split("::").last().unwrap()
         }
     }
 
-    impl<T: DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
+    impl<T: 'static + DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64 {
-            self(arg, time)
+            (*self)(arg, time)
         }
     }
 
     impl<T: Any + fmt::Debug + DynClone> Arg for T {}
 }
 
-impl traits::DebugList for Nil {
+impl DebugList for Nil {
     fn push_debug(this: &Self, debug: &mut fmt::DebugList<'_, '_>) {
         _ = this;
         _ = debug;
     }
 }
-impl<Head: fmt::Debug, Tail: traits::DebugList> traits::DebugList for Cons<Head, Tail> {
+impl<Head: fmt::Debug, Tail: DebugList> DebugList for Cons<Head, Tail> {
     fn push_debug(this: &Self, debug: &mut fmt::DebugList<'_, '_>) {
         debug.entry(&this.head);
         Tail::push_debug(&this.tail, debug)
@@ -124,52 +243,62 @@ impl fmt::Debug for Nil {
         f.debug_list().finish()
     }
 }
-impl<Head: fmt::Debug, Tail: traits::DebugList> fmt::Debug for Cons<Head, Tail> {
+impl<Head: fmt::Debug, Tail: DebugList> fmt::Debug for Cons<Head, Tail> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_list();
-        <Cons<Head, Tail> as traits::DebugList>::push_debug(self, &mut debug);
+        <Cons<Head, Tail> as DebugList>::push_debug(self, &mut debug);
         debug.finish()
     }
 }
 
+/// destructure a variadic tuple for pattern matching.
 #[macro_export]
 macro_rules! unlist {
     () => {
-        $crate::Nil
+        $crate::variadics::Nil
     };
     ($head: pat $(, $tail: pat)* $(,)?) => {
-        $crate::Cons {
+        $crate::variadics::Cons {
             head: $head,
             tail: $crate::unlist!($($tail,)*),
         }
     };
 }
 
+/// create a variadic tuple containing the given values.
 #[macro_export]
 macro_rules! list {
     () => {
-        { $crate::Nil }
+        { $crate::variadics::Nil }
     };
     ($head: expr $(, $tail: expr)* $(,)?) => {
-        $crate::Cons {
+        $crate::variadics::Cons {
             head: $head,
             tail: $crate::list!($($tail,)*),
         }
     };
 }
 
+/// type of a variadic tuple containing the given types.
 #[macro_export]
 macro_rules! List {
     () => {
-        $crate::Nil
+        $crate::variadics::Nil
     };
     ($head: ty $(, $tail: ty)* $(,)?) => {
-        $crate::Cons::<$head, $crate::List!($($tail,)*)>
+        $crate::variadics::Cons::<$head, $crate::List!($($tail,)*)>
     };
 }
 
+/// extra-precise duration type for short-ish durations.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Picoseconds(pub i128);
+
+impl std::iter::Sum for Picoseconds {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|x| x.0).sum())
+    }
+}
 
 impl std::ops::Add for Picoseconds {
     type Output = Picoseconds;
@@ -245,7 +374,9 @@ impl fmt::Debug for Picoseconds {
         let micro = pico / 1e6;
         let milli = pico / 1e9;
         let sec = pico / 1e12;
-        if pico < 1e3 {
+        if self.0 == 0 {
+            write!(f, "{:─^9}", "")
+        } else if pico < 1e3 {
             write!(f, "{pico:6.2} ps")
         } else if nano < 1e3 {
             write!(f, "{nano:6.2} ns")
@@ -265,6 +396,7 @@ struct BenchCtx {
     timings: Vec<Picoseconds>,
 }
 
+/// bench loop runner.
 pub struct Bencher<'a> {
     ctx: &'a mut BenchCtx,
     config: &'a BenchConfig,
@@ -280,6 +412,7 @@ fn measure_time(f: &mut impl FnMut(), iters_per_sample: u64) -> Duration {
 }
 
 impl Bencher<'_> {
+    /// run the function in a loop and measure the timings.
     pub fn bench<R>(self, f: impl FnMut() -> R) {
         let mut f = f;
         let f = &mut || {
@@ -349,242 +482,18 @@ impl Bencher<'_> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct SampleCount(pub u64);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PlotSize {
-    pub x: u32,
-    pub y: u32,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub enum PlotAxis {
-    #[default]
-    Linear,
-    SemiLogX,
-    SemiLogY,
-    LogLog,
-}
-
-pub struct PlotMetric(pub Box<dyn traits::PlotMetric>);
-
-#[derive(Clone, Debug)]
-pub struct PlotDir(pub Option<PathBuf>);
-
-impl Default for PlotDir {
-    fn default() -> Self {
-        Self(cargo_target_directory())
-    }
-}
-
-impl Clone for PlotMetric {
-    fn clone(&self) -> Self {
-        Self(dyn_clone::clone_box(&*self.0))
-    }
-}
-
-impl fmt::Debug for PlotMetric {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("PlotMetric").field(&self.0.name()).finish()
-    }
-}
-
-impl Default for PlotMetric {
-    fn default() -> Self {
-        fn time(_: PlotArg, time: Picoseconds) -> f64 {
-            time.0 as f64 / 1e12
-        }
-        Self(Box::new(time))
-    }
-}
-
-impl PlotMetric {
-    pub fn new(metric: impl 'static + traits::PlotMetric) -> Self {
-        Self(Box::new(metric))
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ItersPerSample {
-    Auto,
-    Manual(u64),
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MinTime(pub Duration);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MaxTime(pub Duration);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TerminalOutput {
-    Quiet,
-    Verbose,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlotName(pub String);
-
-impl Default for SampleCount {
-    fn default() -> Self {
-        Self(100)
-    }
-}
-
-impl Default for ItersPerSample {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
-impl Default for MinTime {
-    fn default() -> Self {
-        Self(Duration::from_millis(100))
-    }
-}
-impl Default for MaxTime {
-    fn default() -> Self {
-        Self(Duration::from_secs(5))
-    }
-}
-
-impl Default for TerminalOutput {
-    fn default() -> Self {
-        Self::Verbose
-    }
-}
-
-impl Default for PlotSize {
-    fn default() -> Self {
-        Self { x: 640, y: 400 }
-    }
-}
-
-impl Default for PlotName {
-    fn default() -> Self {
-        Self("plot".to_string())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BenchConfig {
-    pub sample_count: SampleCount,
-    pub iter_count: ItersPerSample,
-    pub min_time: MinTime,
-    pub max_time: MaxTime,
-    pub verbose: TerminalOutput,
-    pub plot_size: PlotSize,
-    pub plot_axis: PlotAxis,
-    pub plot_name: PlotName,
-    pub plot_metric: PlotMetric,
-    pub plot_dir: PlotDir,
-    pub func_filter: Option<Regex>,
-    pub arg_filter: Option<Regex>,
-    pub output: Option<PathBuf>,
-}
-
-impl BenchConfig {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn from_args() -> Self {
-        let mut config = Self::default();
-
-        #[derive(Parser)]
-        struct Clap {
-            #[arg(long)]
-            bench: bool,
-
-            #[arg(long)]
-            sample_count: Option<u64>,
-
-            #[arg(long)]
-            min_time: Option<f64>,
-
-            #[arg(long)]
-            max_time: Option<f64>,
-
-            #[arg(long)]
-            quiet: bool,
-
-            #[arg(long)]
-            func_filter: Option<Regex>,
-
-            #[arg(long)]
-            arg_filter: Option<Regex>,
-
-            #[arg(long)]
-            output: Option<PathBuf>,
-
-            #[arg(long)]
-            plot_dir: Option<PathBuf>,
-        }
-
-        let clap = Clap::parse();
-        if let Some(sample_count) = clap.sample_count {
-            config.sample_count = SampleCount(sample_count)
-        }
-        if let Some(min_time) = clap.min_time {
-            config.min_time = MinTime(Duration::from_secs_f64(min_time))
-        }
-        if let Some(max_time) = clap.max_time {
-            config.max_time = MaxTime(Duration::from_secs_f64(max_time))
-        }
-        if let true = clap.quiet {
-            config.verbose = TerminalOutput::Quiet;
-        }
-        if let Some(func_filter) = clap.func_filter {
-            config.func_filter = Some(func_filter);
-        }
-        if let Some(arg_filter) = clap.arg_filter {
-            config.arg_filter = Some(arg_filter);
-        }
-        if let Some(plot_dir) = clap.plot_dir {
-            config.plot_dir = PlotDir(Some(plot_dir));
-        }
-        config.output = clap.output;
-
-        config
-    }
-}
-
+/// main benchmark entry point, used to register functions and arguments, then run benchmarks.
 pub struct Bench {
     pub config: BenchConfig,
     pub groups: Vec<(
-        Vec<(String, Box<dyn FnMut(Bencher, Box<dyn Arg>)>)>,
+        Vec<(String, Box<dyn Register<Box<dyn Arg>>>)>,
         Vec<Box<dyn Arg>>,
     )>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BenchArgs {
-    Named(Vec<String>),
-    Plot(Vec<PlotArg>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchFunctionResult {
-    pub name: String,
-    pub timings: Vec<Vec<Picoseconds>>,
-    pub metric: Option<(String, Vec<f64>)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchGroupResult {
-    pub function: Vec<BenchFunctionResult>,
-    pub args: BenchArgs,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchResult {
-    pub groups: Vec<BenchGroupResult>,
-}
-
-impl<T> traits::Register<T> for Nil {
+impl<T> traits::RegisterMany<T> for Nil {
     fn push_name(_: &Self, _: &mut Vec<String>) {}
-    fn push_self(_: Self, _: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>) {}
+    fn push_self(_: Self, _: &mut Vec<Box<dyn Register<Box<dyn Arg>>>>) {}
 }
 
 fn minify_path_segment(segment: &mut syn::PathSegment) {
@@ -683,31 +592,19 @@ fn minify_ty(ty: &mut syn::Type) {
     };
 }
 
-impl<T: Arg, Head: 'static + FnMut(Bencher, T), Tail: traits::Register<T>> traits::Register<T>
+impl<T: Arg, Head: Register<T>, Tail: traits::RegisterMany<T>> traits::RegisterMany<T>
     for Cons<Head, Tail>
 {
     fn push_name(this: &Self, names: &mut Vec<String>) {
-        let name = std::any::type_name::<Head>();
-        if let Ok(mut ty) = syn::parse_str::<syn::Type>(name) {
-            minify_ty(&mut ty);
-            let file = syn::parse2::<syn::File>(quote::quote! { type X = [#ty]; }).unwrap();
-            let file = prettyplease::unparse(&file);
-            let mut file = &*file;
-            file = &file[file.find("[").unwrap() + 1..];
-            file = &file[..file.rfind("]").unwrap()];
-            names.push(format!("{}", file));
-        } else {
-            names.push(name.to_string());
-        }
-
+        names.push(Head::get_name(&this.head));
         Tail::push_name(&this.tail, names);
     }
-    fn push_self(this: Self, boxed: &mut Vec<Box<dyn FnMut(Bencher, Box<dyn Arg>)>>) {
+    fn push_self(this: Self, boxed: &mut Vec<Box<dyn Register<Box<dyn Arg>>>>) {
         let mut f = this.head;
-        boxed.push(Box::new(move |bencher, arg| {
+        boxed.push(Box::new(move |bencher: Bencher<'_>, arg: Box<dyn Arg>| {
             assert!((*arg).type_id() == TypeId::of::<T>());
             let arg: Box<T> = unsafe { Box::from_raw(Box::into_raw(arg) as *mut T) };
-            f(bencher, *arg);
+            f.call_mut(bencher, *arg);
         }));
         Tail::push_self(this.tail, boxed);
     }
@@ -720,6 +617,7 @@ impl AsRef<BenchConfig> for BenchConfig {
 }
 
 impl Bench {
+    /// create a bench object from the given configuration.
     pub fn new(config: impl AsRef<BenchConfig>) -> Self {
         Self {
             config: config.as_ref().clone(),
@@ -727,14 +625,14 @@ impl Bench {
         }
     }
 
-    pub fn register_many_with_names<T: Arg, F: traits::Register<T>>(
+    fn register_many_with_names<T: Arg, F: traits::RegisterMany<T>>(
         &mut self,
         names: Vec<String>,
         f: F,
         args: impl IntoIterator<Item = T>,
     ) {
         let mut boxed = Vec::new();
-        traits::Register::push_self(f, &mut boxed);
+        traits::RegisterMany::push_self(f, &mut boxed);
 
         self.groups.push((
             std::iter::zip(names, boxed).collect(),
@@ -744,33 +642,25 @@ impl Bench {
         ));
     }
 
+    /// register multiple functions that should be compared against each other during benchmarking,
+    /// all taking the same arguments.
     pub fn register_many<T: Arg>(
         &mut self,
-        f: impl Register<T>,
+        f: impl RegisterMany<T>,
         args: impl IntoIterator<Item = T>,
     ) {
         let mut names = Vec::new();
-        Register::push_name(&f, &mut names);
+        RegisterMany::push_name(&f, &mut names);
         self.register_many_with_names(names, f, args);
     }
 
-    pub fn register<T: Arg>(
-        &mut self,
-        f: impl 'static + FnMut(Bencher, T),
-        args: impl IntoIterator<Item = T>,
-    ) {
+    /// register a function for benchmarking, and the arguments that should be passed to it.
+    pub fn register<T: Arg>(&mut self, f: impl Register<T>, args: impl IntoIterator<Item = T>) {
         self.register_many(list![f], args)
     }
 
-    pub fn register_with_name<T: Arg>(
-        &mut self,
-        name: impl AsRef<str>,
-        f: impl 'static + FnMut(Bencher, T),
-        args: impl IntoIterator<Item = T>,
-    ) {
-        self.register_many_with_names(vec![name.as_ref().to_string()], list![f], args)
-    }
-
+    /// run the benchmark, and write the results to stdout, and optionally to a file, depending on
+    /// the configuration options.
     pub fn run(&mut self) -> std::io::Result<BenchResult> {
         let config = &self.config;
         let plot_name = &config.plot_name.0;
@@ -806,20 +696,23 @@ impl Bench {
         max_name_len += 1;
         max_arg_len += 1;
 
-        let verbose = config.verbose == TerminalOutput::Verbose;
+        let verbose = config.verbose == StdoutPrint::Verbose;
 
         let mut plot_id = 0;
 
         for (group, args) in &mut self.groups {
             if verbose {
-                println!(
+                let mut stdout = std::io::stdout();
+                writeln!(
+                    stdout,
                     "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
                     "", "", "", "", "", "",
-                );
-                println!(
+                )?;
+                writeln!(
+                    stdout,
                     "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
                     "benchmark", "args", "fastest", "median", "mean", "stddev",
-                );
+                )?;
             }
 
             let mut group_function_result = Vec::new();
@@ -852,10 +745,7 @@ impl Bench {
                     name: name.to_string(),
                     timings: vec![Vec::new(); args.len()],
                     metric: if max_arg > 0 {
-                        Some((
-                            config.plot_metric.0.name().to_string(),
-                            vec![0.0; args.len()],
-                        ))
+                        Some(vec![0.0; args.len()])
                     } else {
                         None
                     },
@@ -891,10 +781,11 @@ impl Bench {
                 }
 
                 if verbose {
-                    println!(
+                    let mut stdout = std::io::stdout();
+                    writeln!(stdout,
                         "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
                         "", "", "", "", "", "",
-                    );
+                    )?;
                 }
 
                 let fn_count = group.len();
@@ -912,7 +803,7 @@ impl Bench {
                     let mut ctx = BenchCtx {
                         timings: Vec::new(),
                     };
-                    f(
+                    f.call_mut(
                         Bencher {
                             ctx: &mut ctx,
                             config,
@@ -924,8 +815,8 @@ impl Bench {
                     let count = ctx.timings.len();
 
                     if count > 0 {
-                        let sum = ctx.timings.iter().map(|x| x.0).sum::<i128>();
-                        let mean = Picoseconds(sum / count as i128);
+                        let sum = ctx.timings.iter().copied().sum::<Picoseconds>();
+                        let mean = sum / count as i128;
 
                         let variance = if count == 1 {
                             0
@@ -956,11 +847,19 @@ impl Bench {
                                 / count as f64;
 
                             max_y = f64::max(max_y, metric);
-                            lines[idx].0 = ViridisRGBA::get_color(if fn_count == 0 {
+                            let gradient = colorgrad::spectral();
+                            let color = gradient.at(if fn_count == 0 {
                                 0.5
                             } else {
-                                idx as f32 / (fn_count - 1) as f32
+                                idx as f64 / (fn_count - 1) as f64
                             });
+
+                            lines[idx].0 = RGBAColor(
+                                (color.r * 255.0) as u8,
+                                (color.g * 255.0) as u8,
+                                (color.b * 255.0) as u8,
+                                1.0,
+                            );
                             if lines[idx].1.is_empty() {
                                 lines[idx].1 = name.to_string();
                             }
@@ -968,15 +867,16 @@ impl Bench {
                         }
 
                         if verbose {
-                            println!(
+                            let mut stdout = std::io::stdout();
+                            writeln!(stdout,
                                 "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
-                            );
+                            )?;
                         }
                     }
 
                     group_function_result[idx].timings[arg_idx] = ctx.timings;
                     if let Some(metrics) = &mut group_function_result[idx].metric {
-                        metrics.1[arg_idx] = metric;
+                        metrics[arg_idx] = metric;
                     }
                 }
             }
@@ -1030,22 +930,28 @@ impl Bench {
                 }
             }
 
+            let metric_name = config.plot_metric.0.name().to_string();
+
             if group_arg_plot.len() > 0 {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Plot(group_arg_plot),
+                    metric_name,
                 });
             } else {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Named(group_arg_named),
+                    metric_name,
                 });
             }
             if verbose {
-                println!(
+                let mut stdout = std::io::stdout();
+                writeln!(
+                    stdout,
                     "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
                     "", "", "", "", "", "",
-                );
+                )?;
             }
         }
 
@@ -1100,26 +1006,379 @@ fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
         .unwrap();
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PlotArg(pub usize);
+/// re-exports of useful types and traits.
+pub mod prelude {
+    pub use crate::{
+        config::BenchConfig, list, traits::RegisterExt, unlist, Bench, Bencher, List, PlotArg,
+    };
+    pub use std::hint::black_box;
+}
 
-impl fmt::Debug for PlotArg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+/// variadic tuple type.
+pub mod variadics {
+    /// empty tuple.
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Nil;
+
+    /// non-empty tuple, containing the first element and the rest of the elements as a variadic
+    /// tuple.
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Cons<Head, Tail> {
+        /// first element.
+        pub head: Head,
+        /// variadic tuple of the remaining elements.
+        pub tail: Tail,
     }
 }
 
-pub mod prelude {
-    pub use super::{
-        list, unlist, Bench, BenchConfig, Bencher, Cons, ItersPerSample, List, MaxTime, MinTime,
-        PlotArg, PlotAxis, PlotDir, PlotMetric, PlotName, PlotSize, SampleCount, TerminalOutput,
-    };
-    pub use regex::Regex;
+/// argument type that marks the benchmark functions as plottable.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlotArg(pub usize);
+
+/// benchmark configuration
+pub mod config {
+    use super::*;
+
+    impl fmt::Debug for PlotArg {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    /// number of samples to use during benchmarking.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct SampleCount(pub u64);
+
+    /// size of the plot.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct PlotSize {
+        pub x: u32,
+        pub y: u32,
+    }
+
+    /// kind of a plot axis.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+    pub enum PlotAxis {
+        #[default]
+        Linear,
+        SemiLogX,
+        SemiLogY,
+        LogLog,
+    }
+
+    /// metric to use for plots, default is time spent.
+    pub struct PlotMetric(pub Box<dyn traits::PlotMetric>);
+
+    /// plot output directory.
+    #[derive(Clone, Debug)]
+    pub struct PlotDir(pub Option<PathBuf>);
+
+    impl Default for PlotDir {
+        fn default() -> Self {
+            Self(cargo_target_directory())
+        }
+    }
+
+    impl Clone for PlotMetric {
+        fn clone(&self) -> Self {
+            Self(dyn_clone::clone_box(&*self.0))
+        }
+    }
+
+    impl fmt::Debug for PlotMetric {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_tuple("PlotMetric").field(&self.0.name()).finish()
+        }
+    }
+
+    impl Default for PlotMetric {
+        fn default() -> Self {
+            fn time(_: PlotArg, time: Picoseconds) -> f64 {
+                time.0 as f64 / 1e12
+            }
+            Self(Box::new(time))
+        }
+    }
+
+    impl PlotMetric {
+        /// create a new metric from the given metric function.
+        pub fn new(metric: impl traits::PlotMetric) -> Self {
+            Self(Box::new(metric))
+        }
+    }
+
+    /// number of iterations per sample.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum ItersPerSample {
+        /// determine the number of iterations automatically.
+        Auto,
+        /// fixed number of iterations.
+        Manual(u64),
+    }
+
+    /// minimum benchmark time.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct MinTime(pub Duration);
+
+    /// maximum benchmark time.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct MaxTime(pub Duration);
+
+    /// whether the benchmark results should be printed to stdout.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum StdoutPrint {
+        /// do not print to stdout.
+        Quiet,
+        /// print to stdout.
+        Verbose,
+    }
+
+    /// plot file name prefix.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PlotName(pub String);
+
+    impl Default for SampleCount {
+        fn default() -> Self {
+            Self(100)
+        }
+    }
+
+    impl Default for ItersPerSample {
+        fn default() -> Self {
+            Self::Auto
+        }
+    }
+
+    impl Default for MinTime {
+        fn default() -> Self {
+            Self(Duration::from_millis(100))
+        }
+    }
+    impl Default for MaxTime {
+        fn default() -> Self {
+            Self(Duration::from_secs(3))
+        }
+    }
+
+    impl Default for StdoutPrint {
+        fn default() -> Self {
+            Self::Verbose
+        }
+    }
+
+    impl Default for PlotSize {
+        fn default() -> Self {
+            Self { x: 640, y: 400 }
+        }
+    }
+
+    impl Default for PlotName {
+        fn default() -> Self {
+            Self("plot".to_string())
+        }
+    }
+
+    /// colors to use for the generated plot
+    #[derive(Debug, Clone, Default)]
+    pub enum PlotColors {
+        CubehelixDefault,
+        Turbo,
+        Spectral,
+        #[default]
+        Viridis,
+        Magma,
+        Inferno,
+        Plasma,
+        Cividis,
+        Warm,
+        Cool,
+    }
+
+    /// benchmark configuration.
+    #[derive(Debug, Clone, Default)]
+    pub struct BenchConfig {
+        pub sample_count: SampleCount,
+        pub iter_count: ItersPerSample,
+        pub min_time: MinTime,
+        pub max_time: MaxTime,
+        pub verbose: StdoutPrint,
+        pub plot_size: PlotSize,
+        pub plot_axis: PlotAxis,
+        pub plot_name: PlotName,
+        pub plot_metric: PlotMetric,
+        pub plot_dir: PlotDir,
+        pub plot_colors: PlotColors,
+        pub func_filter: Option<Regex>,
+        pub arg_filter: Option<Regex>,
+        pub output: Option<PathBuf>,
+    }
+
+    impl BenchConfig {
+        /// create a default configuration
+        pub fn new() -> Self {
+            Default::default()
+        }
+
+        /// create a configuration from parsed program command-line arguments
+        pub fn from_args() -> Self {
+            let mut config = Self::default();
+
+            #[derive(clap::ValueEnum, Debug, Clone)]
+            #[clap(rename_all = "kebab_case")]
+            enum PlotColors {
+                CubehelixDefault,
+                Turbo,
+                Spectral,
+                Viridis,
+                Magma,
+                Inferno,
+                Plasma,
+                Cividis,
+                Warm,
+                Cool,
+            }
+
+            #[derive(Parser)]
+            struct Clap {
+                #[arg(long, hide(true))]
+                bench: bool,
+
+                /// number of benchmark samples. each benchmark is run at least `sample_count *
+                /// iter_count` times unless the maximum time is reached.
+                #[arg(long)]
+                sample_count: Option<u64>,
+
+                /// minimum time for each benchmark.
+                #[arg(long)]
+                min_time: Option<f64>,
+
+                /// maximum time for each benchmark.
+                #[arg(long)]
+                max_time: Option<f64>,
+
+                /// specifies whether the output should be written to stdout.
+                #[arg(long)]
+                quiet: bool,
+
+                /// regex to filter the benchmark functions.
+                #[arg(long)]
+                func_filter: Option<Regex>,
+
+                /// regex to filter the benchmark arguments.
+                #[arg(long)]
+                arg_filter: Option<Regex>,
+
+                /// output file.
+                #[arg(long)]
+                output: Option<PathBuf>,
+
+                /// plot directory.
+                #[arg(long)]
+                plot_dir: Option<PathBuf>,
+
+                #[arg(long)]
+                colors: Option<PlotColors>,
+            }
+
+            let clap = Clap::parse();
+            if let Some(sample_count) = clap.sample_count {
+                config.sample_count = SampleCount(sample_count)
+            }
+            if let Some(min_time) = clap.min_time {
+                config.min_time = MinTime(Duration::from_secs_f64(min_time))
+            }
+            if let Some(max_time) = clap.max_time {
+                config.max_time = MaxTime(Duration::from_secs_f64(max_time))
+            }
+            if let true = clap.quiet {
+                config.verbose = StdoutPrint::Quiet;
+            }
+            if let Some(func_filter) = clap.func_filter {
+                config.func_filter = Some(func_filter);
+            }
+            if let Some(arg_filter) = clap.arg_filter {
+                config.arg_filter = Some(arg_filter);
+            }
+            if let Some(plot_dir) = clap.plot_dir {
+                config.plot_dir = PlotDir(Some(plot_dir));
+            }
+            if let Some(colors) = clap.colors {
+                config.plot_colors = match colors {
+                    PlotColors::CubehelixDefault => crate::PlotColors::CubehelixDefault,
+                    PlotColors::Turbo => crate::PlotColors::Turbo,
+                    PlotColors::Spectral => crate::PlotColors::Spectral,
+                    PlotColors::Viridis => crate::PlotColors::Viridis,
+                    PlotColors::Magma => crate::PlotColors::Magma,
+                    PlotColors::Inferno => crate::PlotColors::Inferno,
+                    PlotColors::Plasma => crate::PlotColors::Plasma,
+                    PlotColors::Cividis => crate::PlotColors::Cividis,
+                    PlotColors::Warm => crate::PlotColors::Warm,
+                    PlotColors::Cool => crate::PlotColors::Cool,
+                };
+            }
+            config.output = clap.output;
+
+            config
+        }
+    }
+}
+
+/// benchmark result output.
+pub mod result {
+    use super::*;
+
+    /// benchmark arguments.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum BenchArgs {
+        /// generic argument
+        Named(Vec<String>),
+        /// plot argument
+        Plot(Vec<PlotArg>),
+    }
+
+    impl BenchArgs {
+        /// number of arguments
+        pub fn len(&self) -> usize {
+            match self {
+                BenchArgs::Named(a) => a.len(),
+                BenchArgs::Plot(a) => a.len(),
+            }
+        }
+    }
+
+    /// benchmark function timing results.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct BenchFunctionResult {
+        /// function name.
+        pub name: String,
+        /// timings for each argument, given in the same order as the vector in [`BenchArgs`].
+        pub timings: Vec<Vec<Picoseconds>>,
+        /// computed plot metric, if the argument type is [`PlotArg`], otherwise `None`.
+        pub metric: Option<Vec<f64>>,
+    }
+
+    /// benchmark result of a single group.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct BenchGroupResult {
+        /// results of benchmark function timings.
+        pub function: Vec<BenchFunctionResult>,
+        /// benchmark arguments.
+        pub args: BenchArgs,
+        /// metric name for plotting.
+        pub metric_name: String,
+    }
+
+    /// benchmark result of all groups.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct BenchResult {
+        pub groups: Vec<BenchGroupResult>,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prelude::*;
 
     #[test]
     fn test_list() {
@@ -1138,9 +1397,7 @@ mod tests {
         })
     }
 
-    struct S;
-
-    fn popcnt<T>(bencher: Bencher, PlotArg(n): PlotArg) {
+    fn popcnt(bencher: Bencher, PlotArg(n): PlotArg) {
         let bytes = vec![1u8; n];
         bencher.bench(|| popcnt::count_ones(&bytes))
     }
@@ -1151,11 +1408,13 @@ mod tests {
             plot_axis: PlotAxis::LogLog,
             min_time: MinTime(Duration::from_millis(100)),
             max_time: MaxTime(Duration::from_millis(100)),
+            arg_filter: Some(Regex::new("1").unwrap()),
+            output: cargo_target_directory().map(|x| x.join("diol.json")),
             ..Default::default()
         });
         println!();
         bench.register_many(
-            list![naive, popcnt::<S>],
+            list![naive.with_name("naive loop"), popcnt],
             (0..20).map(|i| 1 << i).map(PlotArg),
         );
         bench.run().unwrap();
