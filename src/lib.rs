@@ -125,6 +125,22 @@ const fn isqrt(this: u128) -> u128 {
     res
 }
 
+#[derive(Clone)]
+struct TimeMetric;
+
+impl traits::PlotMetric for TimeMetric {
+    fn name(&self) -> &'static str {
+        "time (s)"
+    }
+    fn compute(&self, _: PlotArg, time: Picoseconds) -> f64 {
+        time.0 as f64 / 1e12
+    }
+
+    fn monotonicity(&self) -> traits::Monotonicity {
+        traits::Monotonicity::LowerIsBetter
+    }
+}
+
 trait DebugList {
     fn push_debug(this: &Self, debug: &mut fmt::DebugList<'_, '_>);
 }
@@ -208,15 +224,27 @@ pub mod traits {
         fn push_self(this: Self, boxed: &mut Vec<Box<dyn Register<Box<dyn Arg>>>>);
     }
 
+    /// whether the plot metric is better when higher, lower, or not monotonic
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Monotonicity {
+        None,
+        HigherIsBetter,
+        LowerIsBetter,
+    }
+
     /// type that can be used as a metric for plots.
-    pub trait PlotMetric: DynClone + 'static {
+    pub trait PlotMetric: DynClone + Any {
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64;
+        fn monotonicity(&self) -> Monotonicity;
         fn name(&self) -> &'static str {
             std::any::type_name::<Self>().split("::").last().unwrap()
         }
     }
 
     impl<T: 'static + DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
+        fn monotonicity(&self) -> Monotonicity {
+            Monotonicity::None
+        }
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64 {
             (*self)(arg, time)
         }
@@ -251,31 +279,37 @@ impl<Head: fmt::Debug, Tail: DebugList> fmt::Debug for Cons<Head, Tail> {
     }
 }
 
-/// destructure a variadic tuple for pattern matching.
 #[macro_export]
-macro_rules! unlist {
-    () => {
+#[doc(hidden)]
+macro_rules! __list_impl {
+    (@ __impl @ () @ ()) => {
         $crate::variadics::Nil
     };
-    ($head: pat $(, $tail: pat)* $(,)?) => {
+
+    (@ __impl @ ($($parsed:tt)+) @ ()) => {
         $crate::variadics::Cons {
-            head: $head,
-            tail: $crate::unlist!($($tail,)*),
+            head: $($parsed)+,
+            tail: $crate::variadics::Nil,
         }
+    };
+
+    (@ __impl @ ($($parsed:tt)+) @ (, $($unparsed:tt)*)) => {
+        $crate::variadics::Cons {
+            head: $($parsed)+,
+            tail: $crate::__list_impl![@ __impl @ () @ ($($unparsed)*)],
+        }
+    };
+
+    (@ __impl @ ($($parsed:tt)*) @ ($unparsed_head: tt $($unparsed_rest:tt)*)) => {
+        $crate::__list_impl![@ __impl @ ($($parsed)* $unparsed_head) @ ($($unparsed_rest)*)]
     };
 }
 
-/// create a variadic tuple containing the given values.
+/// create or destructure a variadic tuple containing the given values.
 #[macro_export]
 macro_rules! list {
-    () => {
-        { $crate::variadics::Nil }
-    };
-    ($head: expr $(, $tail: expr)* $(,)?) => {
-        $crate::variadics::Cons {
-            head: $head,
-            tail: $crate::list!($($tail,)*),
-        }
+    ($($t:tt)*) => {
+        $crate::__list_impl![@ __impl @ () @ ($($t)*)]
     };
 }
 
@@ -293,6 +327,12 @@ macro_rules! List {
 /// extra-precise duration type for short-ish durations.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Picoseconds(pub i128);
+
+impl Picoseconds {
+    pub fn to_secs(self) -> f64 {
+        self.0 as f64 / 1e12
+    }
+}
 
 impl std::iter::Sum for Picoseconds {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
@@ -375,7 +415,7 @@ impl fmt::Debug for Picoseconds {
         let milli = pico / 1e9;
         let sec = pico / 1e12;
         if self.0 == 0 {
-            write!(f, "{:─^9}", "")
+            write!(f, "{: ^9}", "-")
         } else if pico < 1e3 {
             write!(f, "{pico:6.2} ps")
         } else if nano < 1e3 {
@@ -487,7 +527,7 @@ pub struct Bench {
     pub config: BenchConfig,
     pub groups: Vec<(
         Vec<(String, Box<dyn Register<Box<dyn Arg>>>)>,
-        Vec<Box<dyn Arg>>,
+        (TypeId, Vec<Box<dyn Arg>>),
     )>,
 }
 
@@ -636,9 +676,12 @@ impl Bench {
 
         self.groups.push((
             std::iter::zip(names, boxed).collect(),
-            args.into_iter()
-                .map(|arg| Box::new(arg) as Box<dyn Arg>)
-                .collect(),
+            (
+                TypeId::of::<T>(),
+                args.into_iter()
+                    .map(|arg| Box::new(arg) as Box<dyn Arg>)
+                    .collect(),
+            ),
         ));
     }
 
@@ -666,11 +709,17 @@ impl Bench {
         let plot_name = &config.plot_name.0;
         let mut result = BenchResult { groups: Vec::new() };
 
-        let mut max_name_len = 14;
-        let mut max_arg_len = 4;
+        let verbose = config.verbose == StdoutPrint::Verbose;
 
-        for (fns, args) in &self.groups {
-            for (name, _) in fns {
+        let mut plot_id = 0;
+
+        for (group, (type_id, args)) in &mut self.groups {
+            let mut at_least_one_arg = false;
+            let mut at_least_one_func = false;
+            let mut max_name_len = 14;
+            let mut max_arg_len = 4;
+
+            for (name, _) in &**group {
                 if config
                     .func_filter
                     .as_ref()
@@ -678,9 +727,10 @@ impl Bench {
                 {
                     continue;
                 }
+                at_least_one_func = true;
                 max_name_len = Ord::max(max_name_len, name.len());
             }
-            for arg in args {
+            for arg in &**args {
                 let arg = &*format!("{arg:?}");
                 if config
                     .arg_filter
@@ -689,30 +739,48 @@ impl Bench {
                 {
                     continue;
                 }
+                at_least_one_arg = true;
                 max_arg_len = Ord::max(max_arg_len, arg.len());
             }
-        }
 
-        max_name_len += 1;
-        max_arg_len += 1;
+            max_name_len += 1;
+            max_arg_len += 1;
 
-        let verbose = config.verbose == StdoutPrint::Verbose;
+            if !at_least_one_func || !at_least_one_arg {
+                continue;
+            }
 
-        let mut plot_id = 0;
+            let is_plot_arg = *type_id == TypeId::of::<PlotArg>();
+            let is_not_time_metric =
+                (*config.plot_metric.0).type_id() != TypeId::of::<TimeMetric>();
+            let metric_name = config.plot_metric.0.name().to_string();
+            let metric_len = Ord::max(9, metric_name.len() as usize + 1);
 
-        for (group, args) in &mut self.groups {
             if verbose {
                 let mut stdout = std::io::stdout();
-                writeln!(
-                    stdout,
-                    "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
-                    "", "", "", "", "", "",
-                )?;
-                writeln!(
-                    stdout,
-                    "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
-                    "benchmark", "args", "fastest", "median", "mean", "stddev",
-                )?;
+                if is_plot_arg && is_not_time_metric {
+                    writeln!(
+                        stdout,
+                        "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬{:─>metric_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
+                        "", "", "", "", "", "", "",
+                    )?;
+                    writeln!(
+                        stdout,
+                        "│ {:<max_name_len$}│{:>max_arg_len$} │{:>metric_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
+                        "benchmark", "args", metric_name, "fastest", "median", "mean", "stddev",
+                    )?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
+                        "", "", "", "", "", "",
+                    )?;
+                    writeln!(
+                        stdout,
+                        "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
+                        "benchmark", "args", "fastest", "median", "mean", "stddev",
+                    )?;
+                }
             }
 
             let mut group_function_result = Vec::new();
@@ -726,7 +794,8 @@ impl Bench {
                 .map(|dir| dir.join(format!("{plot_name}_{plot_id}.svg")));
             let mut max_arg = 0usize;
             let mut min_arg = usize::MAX;
-            let mut max_y = 0.0f64;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
             let mut lines = vec![(RGBAColor(0, 0, 0, 1.0), String::new(), Vec::new()); group.len()];
 
             for arg in &**args {
@@ -744,8 +813,8 @@ impl Bench {
                 group_function_result.push(BenchFunctionResult {
                     name: name.to_string(),
                     timings: vec![Vec::new(); args.len()],
-                    metric: if max_arg > 0 {
-                        Some(vec![0.0; args.len()])
+                    metric: if is_plot_arg {
+                        Some(vec![vec![]; args.len()])
                     } else {
                         None
                     },
@@ -782,10 +851,19 @@ impl Bench {
 
                 if verbose {
                     let mut stdout = std::io::stdout();
-                    writeln!(stdout,
-                        "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
-                        "", "", "", "", "", "",
-                    )?;
+                    if is_plot_arg && is_not_time_metric {
+                        writeln!(
+                            stdout,
+                            "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼{:─>metric_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
+                            "", "", "", "", "", "", "",
+                        )?;
+                    } else {
+                        writeln!(
+                            stdout,
+                            "├─{:─<max_name_len$}┼{:─>max_arg_len$}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┼─{:─<9}─┤",
+                            "", "", "", "", "", "",
+                        )?;
+                    }
                 }
 
                 let fn_count = group.len();
@@ -811,31 +889,17 @@ impl Bench {
                         dyn_clone::clone_box(&**arg),
                     );
                     ctx.timings.sort_unstable();
-                    let mut metric = 0.0;
+                    let mut metric = vec![];
+                    let mut metric_mean = 0.0;
                     let count = ctx.timings.len();
 
                     if count > 0 {
-                        let sum = ctx.timings.iter().copied().sum::<Picoseconds>();
-                        let mean = sum / count as i128;
-
-                        let variance = if count == 1 {
-                            0
-                        } else {
-                            ctx.timings
-                                .iter()
-                                .map(|x| {
-                                    let diff = x.0 - mean.0;
-                                    diff * diff
-                                })
-                                .sum::<i128>()
-                                / (count as i128 - 1)
-                        };
-                        let stddev = Picoseconds(isqrt(variance as u128) as i128);
+                        let (mean, stddev) = result::Stats::from_slice(&ctx.timings).mean_stddev();
 
                         let fastest = ctx.timings[0];
                         let median = ctx.timings[count / 2];
 
-                        if max_arg > 0 {
+                        if is_plot_arg {
                             assert!((**arg).type_id() == TypeId::of::<PlotArg>());
 
                             let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
@@ -843,10 +907,11 @@ impl Bench {
                                 .timings
                                 .iter()
                                 .map(|time| config.plot_metric.0.compute(*arg, *time))
-                                .sum::<f64>()
-                                / count as f64;
+                                .collect();
+                            metric_mean = result::Stats::from_slice(&metric).mean_stddev().0;
 
-                            max_y = f64::max(max_y, metric);
+                            max_y = f64::max(max_y, metric_mean);
+                            min_y = f64::min(min_y, metric_mean);
                             let gradient = colorgrad::spectral();
                             let color = gradient.at(if fn_count == 0 {
                                 0.5
@@ -863,14 +928,22 @@ impl Bench {
                             if lines[idx].1.is_empty() {
                                 lines[idx].1 = name.to_string();
                             }
-                            lines[idx].2.push((arg.0, metric));
+                            lines[idx].2.push((arg.0, metric_mean));
                         }
 
                         if verbose {
                             let mut stdout = std::io::stdout();
-                            writeln!(stdout,
-                                "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
-                            )?;
+                            if is_plot_arg && is_not_time_metric {
+                                writeln!(
+                                    stdout,
+                                    "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │{metric_mean:>metric_len$.3e} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
+                                )?;
+                            } else {
+                                writeln!(
+                                    stdout,
+                                    "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
+                                )?;
+                            }
                         }
                     }
 
@@ -882,7 +955,7 @@ impl Bench {
             }
 
             if let Some(plot_target) = &plot_target {
-                if max_arg > 0 {
+                if is_plot_arg {
                     let root =
                         SVGBackend::new(plot_target, (config.plot_size.x, config.plot_size.y))
                             .into_drawing_area();
@@ -893,8 +966,16 @@ impl Bench {
                         .x_label_area_size(30)
                         .y_label_area_size(30);
 
-                    let xrange = min_arg as f32..max_arg as f32;
-                    let yrange = 0.0f32..max_y as f32;
+                    let mut xrange = min_arg as f32..max_arg as f32;
+                    let mut yrange = f32::min(min_y as f32, 0.0f32)..max_y as f32;
+
+                    if xrange.end <= xrange.start {
+                        xrange.end = xrange.start + 1.0;
+                    }
+
+                    if yrange.end <= yrange.start {
+                        yrange.end = 1.0;
+                    }
 
                     match config.plot_axis {
                         PlotAxis::Linear => {
@@ -930,8 +1011,6 @@ impl Bench {
                 }
             }
 
-            let metric_name = config.plot_metric.0.name().to_string();
-
             if group_arg_plot.len() > 0 {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
@@ -947,11 +1026,19 @@ impl Bench {
             }
             if verbose {
                 let mut stdout = std::io::stdout();
-                writeln!(
-                    stdout,
-                    "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
-                    "", "", "", "", "", "",
-                )?;
+                if is_plot_arg && is_not_time_metric {
+                    writeln!(
+                        stdout,
+                        "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴{:─>metric_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
+                        "", "", "", "", "", "", "",
+                    )?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "╰─{:─<max_name_len$}┴{:─>max_arg_len$}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─┴─{:─<9}─╯",
+                        "", "", "", "", "", "",
+                    )?;
+                }
             }
         }
 
@@ -1009,7 +1096,7 @@ fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
 /// re-exports of useful types and traits.
 pub mod prelude {
     pub use crate::{
-        config::BenchConfig, list, traits::RegisterExt, unlist, Bench, Bencher, List, PlotArg,
+        config::BenchConfig, list, traits::RegisterExt, Bench, Bencher, List, PlotArg,
     };
     pub use std::hint::black_box;
 }
@@ -1093,10 +1180,7 @@ pub mod config {
 
     impl Default for PlotMetric {
         fn default() -> Self {
-            fn time(_: PlotArg, time: Picoseconds) -> f64 {
-                time.0 as f64 / 1e12
-            }
-            Self(Box::new(time))
+            Self(Box::new(TimeMetric))
         }
     }
 
@@ -1327,6 +1411,91 @@ pub mod config {
 pub mod result {
     use super::*;
 
+    #[derive(Debug)]
+    #[repr(transparent)]
+    pub struct Stats<T>(pub [T]);
+
+    impl<T> std::ops::Deref for Stats<T> {
+        type Target = [T];
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl<T> std::ops::DerefMut for Stats<T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl<T> Stats<T> {
+        pub fn from_slice(slice: &[T]) -> &Self {
+            unsafe { &*(slice as *const [T] as *const Self) }
+        }
+
+        pub fn from_slice_mut(slice: &mut [T]) -> &mut Self {
+            unsafe { &mut *(slice as *mut [T] as *mut Self) }
+        }
+    }
+
+    impl Stats<Picoseconds> {
+        pub fn mean_stddev(&self) -> (Picoseconds, Picoseconds) {
+            let count = self.len();
+            let sum = self.0.iter().copied().sum::<Picoseconds>();
+            let mean = sum / count as i128;
+
+            let variance = if count <= 1 {
+                0
+            } else {
+                self.0
+                    .iter()
+                    .map(|x| {
+                        let diff = x.0 - mean.0;
+                        diff * diff
+                    })
+                    .sum::<i128>()
+                    / (count as i128 - 1)
+            };
+            let stddev = Picoseconds(isqrt(variance as u128) as i128);
+
+            (mean, stddev)
+        }
+    }
+
+    impl Stats<f64> {
+        pub fn mean_stddev(&self) -> (f64, f64) {
+            let count = self.len();
+            let sum = self.0.iter().copied().sum::<f64>();
+            let mean = sum / count as f64;
+
+            let variance = if count <= 1 {
+                0.0
+            } else {
+                self.0
+                    .iter()
+                    .map(|x| {
+                        let diff = x - mean;
+                        diff * diff
+                    })
+                    .sum::<f64>()
+                    / ((count - 1) as f64)
+            };
+            let stddev = variance.sqrt();
+
+            (mean, stddev)
+        }
+    }
+
+    /// single benchmark argument.
+    #[derive(Debug, Copy, Clone)]
+    pub enum BenchArg<'a> {
+        /// generic argument
+        Named(&'a str),
+        /// plot argument
+        Plot(PlotArg),
+    }
+
     /// benchmark arguments.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum BenchArgs {
@@ -1354,7 +1523,7 @@ pub mod result {
         /// timings for each argument, given in the same order as the vector in [`BenchArgs`].
         pub timings: Vec<Vec<Picoseconds>>,
         /// computed plot metric, if the argument type is [`PlotArg`], otherwise `None`.
-        pub metric: Option<Vec<f64>>,
+        pub metric: Option<Vec<Vec<f64>>>,
     }
 
     /// benchmark result of a single group.
@@ -1373,6 +1542,66 @@ pub mod result {
     pub struct BenchResult {
         pub groups: Vec<BenchGroupResult>,
     }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Group(pub usize);
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Func(pub usize);
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Arg(pub usize);
+
+    impl BenchFunctionResult {
+        /// get the timings and metrics for the given argument index
+        #[track_caller]
+        pub fn at(&self, Arg(arg_idx): Arg) -> (&Stats<Picoseconds>, Option<&Stats<f64>>) {
+            equator::assert!(arg_idx < self.timings.len());
+
+            (
+                Stats::from_slice(&self.timings[arg_idx]),
+                self.metric
+                    .as_ref()
+                    .map(|metric| Stats::from_slice(&*metric[arg_idx])),
+            )
+        }
+    }
+
+    impl BenchGroupResult {
+        /// get the timings and metrics for the given function and argument index
+        #[track_caller]
+        pub fn at(
+            &self,
+            Func(func_idx): Func,
+            Arg(arg_idx): Arg,
+        ) -> (&Stats<Picoseconds>, Option<&Stats<f64>>) {
+            equator::assert!(all(
+                func_idx < self.function.len(),
+                arg_idx < self.args.len(),
+            ));
+            self.function[func_idx].at(Arg(arg_idx))
+        }
+
+        #[track_caller]
+        pub fn arg(&self, i: usize) -> BenchArg<'_> {
+            match &self.args {
+                BenchArgs::Named(name) => BenchArg::Named(&name[i]),
+                BenchArgs::Plot(arg) => BenchArg::Plot(arg[i]),
+            }
+        }
+    }
+
+    impl BenchResult {
+        /// get the timings and metrics for the given group, function and argument index
+        #[track_caller]
+        pub fn at(
+            &self,
+            Group(group_idx): Group,
+            Func(func_idx): Func,
+            Arg(arg_idx): Arg,
+        ) -> (&Stats<Picoseconds>, Option<&Stats<f64>>) {
+            equator::assert!(group_idx < self.groups.len());
+            self.groups[group_idx].at(Func(func_idx), Arg(arg_idx))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1380,9 +1609,24 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    #[derive(Clone)]
+    pub struct BytesPerSecMetric;
+    impl traits::PlotMetric for BytesPerSecMetric {
+        fn name(&self) -> &'static str {
+            "bytes/s"
+        }
+        fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64 {
+            arg.0 as f64 / time.to_secs()
+        }
+        fn monotonicity(&self) -> traits::Monotonicity {
+            traits::Monotonicity::HigherIsBetter
+        }
+    }
+
     #[test]
     fn test_list() {
-        let unlist![_, _, _]: List![i32, u32, usize] = list![1, 2, 3];
+        let list![_, _, _,]: List![i32, u32, usize] = list![1, 2, 3,];
+        let list![_, _, _]: List![i32, u32, usize] = list![1, 2, 3];
         println!("{:?}", list![1, 3, vec![1.0]]);
     }
 
