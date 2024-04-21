@@ -55,12 +55,6 @@
 use clap::Parser;
 use dyn_clone::DynClone;
 use equator::assert;
-use plotters::{
-    coord::ranged1d::{AsRangedCoord, ValueFormatter},
-    element::PointCollection,
-    prelude::*,
-    style::full_palette::*,
-};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -225,7 +219,7 @@ pub mod traits {
     }
 
     /// whether the plot metric is better when higher, lower, or not monotonic
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Monotonicity {
         None,
         HigherIsBetter,
@@ -236,7 +230,7 @@ pub mod traits {
     pub trait PlotMetric: DynClone + Any {
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64;
         fn monotonicity(&self) -> Monotonicity;
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             std::any::type_name::<Self>().split("::").last().unwrap()
         }
     }
@@ -665,6 +659,18 @@ impl Bench {
         }
     }
 
+    #[doc(hidden)]
+    pub unsafe fn register_many_dyn(
+        &mut self,
+        names: Vec<String>,
+        boxed: Vec<Box<dyn Register<Box<dyn Arg>>>>,
+        type_id: TypeId,
+        args: Vec<Box<dyn Arg>>,
+    ) {
+        self.groups
+            .push((std::iter::zip(names, boxed).collect(), (type_id, args)))
+    }
+
     fn register_many_with_names<T: Arg, F: traits::RegisterMany<T>>(
         &mut self,
         names: Vec<String>,
@@ -706,12 +712,14 @@ impl Bench {
     /// the configuration options.
     pub fn run(&mut self) -> std::io::Result<BenchResult> {
         let config = &self.config;
-        let plot_name = &config.plot_name.0;
         let mut result = BenchResult { groups: Vec::new() };
 
         let verbose = config.verbose == StdoutPrint::Verbose;
 
+        #[cfg(feature = "plot")]
         let mut plot_id = 0;
+        #[cfg(feature = "plot")]
+        let plot_name = &config.plot_name.0;
 
         for (group, (type_id, args)) in &mut self.groups {
             let mut at_least_one_arg = false;
@@ -754,6 +762,7 @@ impl Bench {
             let is_not_time_metric =
                 (*config.plot_metric.0).type_id() != TypeId::of::<TimeMetric>();
             let metric_name = config.plot_metric.0.name().to_string();
+            let metric_mono = config.plot_metric.0.monotonicity();
             let metric_len = Ord::max(9, metric_name.len() as usize + 1);
 
             if verbose {
@@ -787,6 +796,7 @@ impl Bench {
             let mut group_arg_named = Vec::new();
             let mut group_arg_plot = Vec::new();
 
+            #[cfg(feature = "plot")]
             let plot_target = config
                 .plot_dir
                 .0
@@ -796,7 +806,7 @@ impl Bench {
             let mut min_arg = usize::MAX;
             let mut max_y = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;
-            let mut lines = vec![(RGBAColor(0, 0, 0, 1.0), String::new(), Vec::new()); group.len()];
+            let mut lines = vec![((0u8, 0u8, 0u8, 1.0), String::new(), Vec::new()); group.len()];
 
             for arg in &**args {
                 if (**arg).type_id() == TypeId::of::<PlotArg>() {
@@ -919,7 +929,7 @@ impl Bench {
                                 idx as f64 / (fn_count - 1) as f64
                             });
 
-                            lines[idx].0 = RGBAColor(
+                            lines[idx].0 = (
                                 (color.r * 255.0) as u8,
                                 (color.g * 255.0) as u8,
                                 (color.b * 255.0) as u8,
@@ -954,7 +964,59 @@ impl Bench {
                 }
             }
 
+            #[cfg(feature = "plot")]
             if let Some(plot_target) = &plot_target {
+                use plotters::{
+                    coord::ranged1d::{AsRangedCoord, ValueFormatter},
+                    element::PointCollection,
+                    prelude::*,
+                    style::full_palette::*,
+                };
+
+                fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
+                    _: &BenchConfig,
+                    mut builder: ChartBuilder<'_, '_, SVGBackend<'a>>,
+                    xrange: X,
+                    yrange: Y,
+                    plot_id: &mut i32,
+                    lines: Vec<((u8, u8, u8, f64), String, Vec<(usize, f64)>)>,
+                ) where
+                    X::CoordDescType: ValueFormatter<X::Value>,
+                    Y::CoordDescType: ValueFormatter<Y::Value>,
+                    for<'b> &'b DynElement<'static, SVGBackend<'a>, (f32, f32)>:
+                        PointCollection<'b, (X::Value, Y::Value)>,
+                {
+                    let mut chart = builder.build_cartesian_2d(xrange, yrange).unwrap();
+                    chart.configure_mesh().max_light_lines(2).draw().unwrap();
+                    *plot_id += 1;
+
+                    for (color, name, line) in &lines {
+                        let style = ShapeStyle {
+                            color: RGBAColor(color.0, color.1, color.2, color.3),
+                            filled: false,
+                            stroke_width: 3,
+                        };
+                        chart
+                            .draw_series(LineSeries::new(
+                                line.iter().map(|&(n, metric)| (n as f32, metric as f32)),
+                                style,
+                            ))
+                            .unwrap()
+                            .label(name)
+                            .legend(move |(x, y)| {
+                                PathElement::new(vec![(x + 20, y), (x, y)], style)
+                            });
+                    }
+
+                    chart
+                        .configure_series_labels()
+                        .position(SeriesLabelPosition::UpperLeft)
+                        .background_style(&GREY_A100.mix(0.8))
+                        .border_style(&full_palette::BLACK)
+                        .draw()
+                        .unwrap();
+                }
+
                 if is_plot_arg {
                     let root =
                         SVGBackend::new(plot_target, (config.plot_size.x, config.plot_size.y))
@@ -1016,12 +1078,14 @@ impl Bench {
                     function: group_function_result,
                     args: BenchArgs::Plot(group_arg_plot),
                     metric_name,
+                    metric_mono,
                 });
             } else {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Named(group_arg_named),
                     metric_name,
+                    metric_mono,
                 });
             }
             if verbose {
@@ -1051,48 +1115,6 @@ impl Bench {
     }
 }
 
-fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
-    _: &BenchConfig,
-    mut builder: ChartBuilder<'_, '_, SVGBackend<'a>>,
-    xrange: X,
-    yrange: Y,
-    plot_id: &mut i32,
-    lines: Vec<(RGBAColor, String, Vec<(usize, f64)>)>,
-) where
-    X::CoordDescType: ValueFormatter<X::Value>,
-    Y::CoordDescType: ValueFormatter<Y::Value>,
-    for<'b> &'b DynElement<'static, SVGBackend<'a>, (f32, f32)>:
-        PointCollection<'b, (X::Value, Y::Value)>,
-{
-    let mut chart = builder.build_cartesian_2d(xrange, yrange).unwrap();
-    chart.configure_mesh().max_light_lines(2).draw().unwrap();
-    *plot_id += 1;
-
-    for (color, name, line) in &lines {
-        let style = ShapeStyle {
-            color: *color,
-            filled: false,
-            stroke_width: 3,
-        };
-        chart
-            .draw_series(LineSeries::new(
-                line.iter().map(|&(n, metric)| (n as f32, metric as f32)),
-                style,
-            ))
-            .unwrap()
-            .label(name)
-            .legend(move |(x, y)| PathElement::new(vec![(x + 20, y), (x, y)], style));
-    }
-
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(&GREY_A100.mix(0.8))
-        .border_style(&full_palette::BLACK)
-        .draw()
-        .unwrap();
-}
-
 /// re-exports of useful types and traits.
 pub mod prelude {
     pub use crate::{
@@ -1120,6 +1142,7 @@ pub mod variadics {
 
 /// argument type that marks the benchmark functions as plottable.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(C)]
 pub struct PlotArg(pub usize);
 
 /// benchmark configuration
@@ -1409,6 +1432,8 @@ pub mod config {
 
 /// benchmark result output.
 pub mod result {
+    pub use self::traits::Monotonicity;
+
     use super::*;
 
     #[derive(Debug)]
@@ -1535,6 +1560,7 @@ pub mod result {
         pub args: BenchArgs,
         /// metric name for plotting.
         pub metric_name: String,
+        pub metric_mono: Monotonicity,
     }
 
     /// benchmark result of all groups.
