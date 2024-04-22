@@ -1597,7 +1597,7 @@ pub mod result {
     }
 
     /// single benchmark argument.
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
     pub enum BenchArg<'a> {
         /// generic argument
         Named(&'a str),
@@ -1606,7 +1606,7 @@ pub mod result {
     }
 
     /// benchmark arguments.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
     pub enum BenchArgs {
         /// generic argument
         Named(Vec<String>),
