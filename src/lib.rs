@@ -319,7 +319,7 @@ macro_rules! List {
 }
 
 /// extra-precise duration type for short-ish durations.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub struct Picoseconds(pub i128);
 
 impl Picoseconds {
@@ -446,6 +446,10 @@ fn measure_time(f: &mut impl FnMut(), iters_per_sample: u64) -> Duration {
 }
 
 impl Bencher<'_> {
+    pub fn skip(self) {
+        self.ctx.timings.clear();
+    }
+
     /// run the function in a loop and measure the timings.
     pub fn bench<R>(self, f: impl FnMut() -> R) {
         let mut f = f;
@@ -903,57 +907,55 @@ impl Bench {
                     let mut metric_mean = 0.0;
                     let count = ctx.timings.len();
 
-                    if count > 0 {
-                        let (mean, stddev) = result::Stats::from_slice(&ctx.timings).mean_stddev();
+                    let (mean, stddev) = result::Stats::from_slice(&ctx.timings).mean_stddev();
 
-                        let fastest = ctx.timings[0];
-                        let median = ctx.timings[count / 2];
+                    let fastest = ctx.timings.get(0).copied().unwrap_or_default();
+                    let median = ctx.timings.get(count / 2).copied().unwrap_or_default();
 
-                        if is_plot_arg {
-                            assert!((**arg).type_id() == TypeId::of::<PlotArg>());
+                    if is_plot_arg {
+                        assert!((**arg).type_id() == TypeId::of::<PlotArg>());
 
-                            let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
-                            metric = ctx
-                                .timings
-                                .iter()
-                                .map(|time| config.plot_metric.0.compute(*arg, *time))
-                                .collect();
-                            metric_mean = result::Stats::from_slice(&metric).mean_stddev().0;
+                        let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
+                        metric = ctx
+                            .timings
+                            .iter()
+                            .map(|time| config.plot_metric.0.compute(*arg, *time))
+                            .collect();
+                        metric_mean = result::Stats::from_slice(&metric).mean_stddev().0;
 
-                            max_y = f64::max(max_y, metric_mean);
-                            min_y = f64::min(min_y, metric_mean);
-                            let gradient = colorgrad::spectral();
-                            let color = gradient.at(if fn_count == 0 {
-                                0.5
-                            } else {
-                                idx as f64 / (fn_count - 1) as f64
-                            });
+                        max_y = f64::max(max_y, metric_mean);
+                        min_y = f64::min(min_y, metric_mean);
+                        let gradient = colorgrad::spectral();
+                        let color = gradient.at(if fn_count == 0 {
+                            0.5
+                        } else {
+                            idx as f64 / (fn_count - 1) as f64
+                        });
 
-                            lines[idx].0 = (
-                                (color.r * 255.0) as u8,
-                                (color.g * 255.0) as u8,
-                                (color.b * 255.0) as u8,
-                                1.0,
-                            );
-                            if lines[idx].1.is_empty() {
-                                lines[idx].1 = name.to_string();
-                            }
-                            lines[idx].2.push((arg.0, metric_mean));
+                        lines[idx].0 = (
+                            (color.r * 255.0) as u8,
+                            (color.g * 255.0) as u8,
+                            (color.b * 255.0) as u8,
+                            1.0,
+                        );
+                        if lines[idx].1.is_empty() {
+                            lines[idx].1 = name.to_string();
                         }
+                        lines[idx].2.push((arg.0, metric_mean));
+                    }
 
-                        if verbose {
-                            let mut stdout = std::io::stdout();
-                            if is_plot_arg && is_not_time_metric {
-                                writeln!(
+                    if verbose {
+                        let mut stdout = std::io::stdout();
+                        if is_plot_arg && is_not_time_metric {
+                            writeln!(
                                     stdout,
                                     "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │{metric_mean:>metric_len$.3e} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
                                 )?;
-                            } else {
-                                writeln!(
+                        } else {
+                            writeln!(
                                     stdout,
                                     "│ {name:<max_name_len$}│{arg_str:>max_arg_len$} │ {fastest:?} │ {median:?} │ {mean:?} │ {stddev:?} │"
                                 )?;
-                            }
                         }
                     }
 
@@ -1147,6 +1149,8 @@ pub struct PlotArg(pub usize);
 
 /// benchmark configuration
 pub mod config {
+    use std::io;
+
     use super::*;
 
     impl fmt::Debug for PlotArg {
@@ -1327,11 +1331,12 @@ pub mod config {
         }
 
         /// create a configuration from parsed program command-line arguments
-        pub fn from_args() -> Self {
+        pub fn from_args() -> io::Result<Self> {
             let mut config = Self::default();
 
-            #[derive(clap::ValueEnum, Debug, Clone)]
+            #[derive(clap::ValueEnum, Debug, Clone, Serialize, Deserialize)]
             #[clap(rename_all = "kebab_case")]
+            #[serde(rename_all = "kebab-case")]
             enum PlotColors {
                 CubehelixDefault,
                 Turbo,
@@ -1345,10 +1350,29 @@ pub mod config {
                 Cool,
             }
 
+            #[derive(Serialize, Deserialize)]
+            struct Toml {
+                sample_count: Option<u64>,
+                min_time: Option<f64>,
+                max_time: Option<f64>,
+                quiet: Option<bool>,
+                output: Option<PathBuf>,
+                plot_dir: Option<PathBuf>,
+                colors: Option<PlotColors>,
+            }
+
             #[derive(Parser)]
             struct Clap {
                 #[arg(long, hide(true))]
                 bench: bool,
+
+                /// config toml file.
+                #[arg(long)]
+                config: Option<PathBuf>,
+
+                /// config toml file to write the config to.
+                #[arg(long)]
+                config_out: Option<PathBuf>,
 
                 /// number of benchmark samples. each benchmark is run at least `sample_count *
                 /// iter_count` times unless the maximum time is reached.
@@ -1388,28 +1412,48 @@ pub mod config {
             }
 
             let clap = Clap::parse();
-            if let Some(sample_count) = clap.sample_count {
+
+            let toml: Option<io::Result<Toml>> = clap.config.map(|toml| {
+                toml::de::from_str(&std::fs::read_to_string(&toml)?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            });
+            let toml = match toml {
+                Some(Ok(toml)) => Some(toml),
+                Some(Err(e)) => return Err(e),
+                None => None,
+            }
+            .unwrap_or(Toml {
+                sample_count: None,
+                min_time: None,
+                max_time: None,
+                quiet: None,
+                output: None,
+                plot_dir: None,
+                colors: None,
+            });
+
+            if let (Some(sample_count), _) | (None, Some(sample_count)) =
+                (clap.sample_count, toml.sample_count)
+            {
                 config.sample_count = SampleCount(sample_count)
             }
-            if let Some(min_time) = clap.min_time {
+
+            if let (Some(min_time), _) | (None, Some(min_time)) = (clap.min_time, toml.min_time) {
                 config.min_time = MinTime(Duration::from_secs_f64(min_time))
             }
-            if let Some(max_time) = clap.max_time {
+            if let (Some(max_time), _) | (None, Some(max_time)) = (clap.max_time, toml.max_time) {
                 config.max_time = MaxTime(Duration::from_secs_f64(max_time))
             }
-            if let true = clap.quiet {
-                config.verbose = StdoutPrint::Quiet;
-            }
-            if let Some(func_filter) = clap.func_filter {
-                config.func_filter = Some(func_filter);
-            }
-            if let Some(arg_filter) = clap.arg_filter {
-                config.arg_filter = Some(arg_filter);
-            }
-            if let Some(plot_dir) = clap.plot_dir {
+            if let (Some(plot_dir), _) | (None, Some(plot_dir)) = (clap.plot_dir, toml.plot_dir) {
                 config.plot_dir = PlotDir(Some(plot_dir));
             }
-            if let Some(colors) = clap.colors {
+            if clap.quiet || toml.quiet == Some(true) {
+                config.verbose = StdoutPrint::Quiet;
+            }
+            if let (Some(output), _) | (None, Some(output)) = (clap.output, toml.output) {
+                config.output = Some(output);
+            };
+            if let (Some(colors), _) | (None, Some(colors)) = (clap.colors, toml.colors) {
                 config.plot_colors = match colors {
                     PlotColors::CubehelixDefault => crate::PlotColors::CubehelixDefault,
                     PlotColors::Turbo => crate::PlotColors::Turbo,
@@ -1423,9 +1467,41 @@ pub mod config {
                     PlotColors::Cool => crate::PlotColors::Cool,
                 };
             }
-            config.output = clap.output;
 
-            config
+            if let Some(func_filter) = clap.func_filter {
+                config.func_filter = Some(func_filter);
+            }
+            if let Some(arg_filter) = clap.arg_filter {
+                config.arg_filter = Some(arg_filter);
+            }
+
+            if let Some(config_out) = clap.config_out {
+                let toml = Toml {
+                    sample_count: Some(config.sample_count.0),
+                    min_time: Some(config.min_time.0.as_secs_f64()),
+                    max_time: Some(config.max_time.0.as_secs_f64()),
+                    quiet: Some(config.verbose == StdoutPrint::Quiet),
+                    output: config.output.clone(),
+                    plot_dir: config.plot_dir.0.clone(),
+                    colors: Some(match config.plot_colors {
+                        crate::PlotColors::CubehelixDefault => PlotColors::CubehelixDefault,
+                        crate::PlotColors::Turbo => PlotColors::Turbo,
+                        crate::PlotColors::Spectral => PlotColors::Spectral,
+                        crate::PlotColors::Viridis => PlotColors::Viridis,
+                        crate::PlotColors::Magma => PlotColors::Magma,
+                        crate::PlotColors::Inferno => PlotColors::Inferno,
+                        crate::PlotColors::Plasma => PlotColors::Plasma,
+                        crate::PlotColors::Cividis => PlotColors::Cividis,
+                        crate::PlotColors::Warm => PlotColors::Warm,
+                        crate::PlotColors::Cool => PlotColors::Cool,
+                    }),
+                };
+                let toml = toml::ser::to_string_pretty(&toml)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                std::fs::write(config_out, toml)?;
+            }
+
+            Ok(config)
         }
     }
 }
@@ -1466,6 +1542,10 @@ pub mod result {
 
     impl Stats<Picoseconds> {
         pub fn mean_stddev(&self) -> (Picoseconds, Picoseconds) {
+            if self.len() == 0 {
+                return (Picoseconds(0), Picoseconds(0));
+            }
+
             let count = self.len();
             let sum = self.0.iter().copied().sum::<Picoseconds>();
             let mean = sum / count as i128;
@@ -1490,6 +1570,10 @@ pub mod result {
 
     impl Stats<f64> {
         pub fn mean_stddev(&self) -> (f64, f64) {
+            if self.len() == 0 {
+                return (f64::NAN, f64::NAN);
+            }
+
             let count = self.len();
             let sum = self.0.iter().copied().sum::<f64>();
             let mean = sum / count as f64;
@@ -1536,6 +1620,22 @@ pub mod result {
             match self {
                 BenchArgs::Named(a) => a.len(),
                 BenchArgs::Plot(a) => a.len(),
+            }
+        }
+
+        #[track_caller]
+        pub fn unwrap_as_named(&self) -> &[String] {
+            match self {
+                BenchArgs::Named(this) => this,
+                BenchArgs::Plot(_) => panic!(),
+            }
+        }
+
+        #[track_caller]
+        pub fn unwrap_as_plot_arg(&self) -> &[PlotArg] {
+            match self {
+                BenchArgs::Named(_) => panic!(),
+                BenchArgs::Plot(this) => this,
             }
         }
     }
