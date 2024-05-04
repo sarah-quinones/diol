@@ -726,8 +726,8 @@ impl Bench {
         let plot_name = &config.plot_name.0;
 
         for (group, (type_id, args)) in &mut self.groups {
-            let mut at_least_one_arg = false;
-            let mut at_least_one_func = false;
+            let mut nargs = 0;
+            let mut nfuncs = 0;
             let mut max_name_len = 14;
             let mut max_arg_len = 4;
 
@@ -739,7 +739,7 @@ impl Bench {
                 {
                     continue;
                 }
-                at_least_one_func = true;
+                nfuncs += 1;
                 max_name_len = Ord::max(max_name_len, name.len());
             }
             for arg in &**args {
@@ -751,14 +751,14 @@ impl Bench {
                 {
                     continue;
                 }
-                at_least_one_arg = true;
+                nargs += 1;
                 max_arg_len = Ord::max(max_arg_len, arg.len());
             }
 
             max_name_len += 1;
             max_arg_len += 1;
 
-            if !at_least_one_func || !at_least_one_arg {
+            if nargs == 0 || nfuncs == 0 {
                 continue;
             }
 
@@ -824,6 +824,14 @@ impl Bench {
                 }
             }
             for (name, _) in &**group {
+                if config
+                    .func_filter
+                    .as_ref()
+                    .is_some_and(|regex| !regex.is_match(name))
+                {
+                    continue;
+                }
+
                 group_function_result.push(BenchFunctionResult {
                     name: name.to_string(),
                     timings: vec![Vec::new(); args.len()],
@@ -846,23 +854,6 @@ impl Bench {
                     continue;
                 }
 
-                let mut func_count = 0usize;
-
-                for (name, _) in group.iter() {
-                    let name = &**name;
-                    if config
-                        .func_filter
-                        .as_ref()
-                        .is_some_and(|regex| !regex.is_match(name))
-                    {
-                        continue;
-                    }
-                    func_count += 1;
-                }
-                if func_count == 0 {
-                    continue;
-                }
-
                 if verbose {
                     let mut stdout = std::io::stdout();
                     if is_plot_arg && is_not_time_metric {
@@ -880,16 +871,17 @@ impl Bench {
                     }
                 }
 
-                let fn_count = group.len();
-                for (idx, (name, f)) in group.iter_mut().enumerate() {
+                for (idx, (name, f)) in group
+                    .iter_mut()
+                    .filter(|(name, _)| {
+                        !config
+                            .func_filter
+                            .as_ref()
+                            .is_some_and(|regex| !regex.is_match(name))
+                    })
+                    .enumerate()
+                {
                     let name = &**name;
-                    if config
-                        .func_filter
-                        .as_ref()
-                        .is_some_and(|regex| !regex.is_match(name))
-                    {
-                        continue;
-                    }
 
                     let f = &mut **f;
                     let mut ctx = BenchCtx {
@@ -926,10 +918,10 @@ impl Bench {
                         max_y = f64::max(max_y, metric_mean);
                         min_y = f64::min(min_y, metric_mean);
                         let gradient = colorgrad::spectral();
-                        let color = gradient.at(if fn_count == 0 {
+                        let color = gradient.at(if nfuncs == 0 {
                             0.5
                         } else {
-                            idx as f64 / (fn_count - 1) as f64
+                            idx as f64 / (nfuncs - 1) as f64
                         });
 
                         lines[idx].0 = (
