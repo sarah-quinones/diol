@@ -12,7 +12,7 @@ then in `benches/my_benchmark.rs`.
 ```rust
 use diol::prelude::*;
 fn main() -> std::io::Result<()> {
-    let mut bench = Bench::new(BenchConfig::from_args());
+    let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
     bench.run()?;
     Ok(())
