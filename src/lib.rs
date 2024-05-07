@@ -199,9 +199,9 @@ pub mod traits {
                 let file = syn::parse2::<syn::File>(quote::quote! { type X = [#ty]; }).unwrap();
                 let file = prettyplease::unparse(&file);
                 let mut file = &*file;
-                file = &file[file.find("[").unwrap() + 1..];
-                file = &file[..file.rfind("]").unwrap()];
-                format!("{}", file)
+                file = &file[file.find('[').unwrap() + 1..];
+                file = &file[..file.rfind(']').unwrap()];
+                file.to_string()
             } else {
                 name.to_string()
             }
@@ -520,13 +520,15 @@ impl Bencher<'_> {
     }
 }
 
+type BencherGroup = (
+    Vec<(String, Box<dyn Register<Box<dyn Arg>>>)>,
+    (TypeId, Vec<Box<dyn Arg>>)
+);
+
 /// main benchmark entry point, used to register functions and arguments, then run benchmarks.
 pub struct Bench {
     pub config: BenchConfig,
-    pub groups: Vec<(
-        Vec<(String, Box<dyn Register<Box<dyn Arg>>>)>,
-        (TypeId, Vec<Box<dyn Arg>>),
-    )>,
+    pub groups: Vec<BencherGroup>,
 }
 
 impl<T> traits::RegisterMany<T> for Nil {
@@ -567,17 +569,14 @@ fn minify_path_segment(segment: &mut syn::PathSegment) {
 }
 
 fn minify_bound(bound: &mut syn::TypeParamBound) {
-    match bound {
-        syn::TypeParamBound::Trait(t) => {
-            t.path.leading_colon = None;
-            if let Some(last) = t.path.segments.pop() {
-                let mut last = last.into_value();
-                minify_path_segment(&mut last);
-                t.path.segments.clear();
-                t.path.segments.push_value(last);
-            }
+    if let syn::TypeParamBound::Trait(t) = bound {
+        t.path.leading_colon = None;
+        if let Some(last) = t.path.segments.pop() {
+            let mut last = last.into_value();
+            minify_path_segment(&mut last);
+            t.path.segments.clear();
+            t.path.segments.push_value(last);
         }
-        _ => {}
     }
 }
 
@@ -767,7 +766,7 @@ impl Bench {
                 (*config.plot_metric.0).type_id() != TypeId::of::<TimeMetric>();
             let metric_name = config.plot_metric.0.name().to_string();
             let metric_mono = config.plot_metric.0.monotonicity();
-            let metric_len = Ord::max(9, metric_name.len() as usize + 1);
+            let metric_len = Ord::max(9, metric_name.len() + 1);
 
             if verbose {
                 let mut stdout = std::io::stdout();
@@ -901,7 +900,7 @@ impl Bench {
 
                     let (mean, stddev) = result::Stats::from_slice(&ctx.timings).mean_stddev();
 
-                    let fastest = ctx.timings.get(0).copied().unwrap_or_default();
+                    let fastest = ctx.timings.first().copied().unwrap_or_default();
                     let median = ctx.timings.get(count / 2).copied().unwrap_or_default();
 
                     if is_plot_arg {
@@ -967,13 +966,15 @@ impl Bench {
                     style::full_palette::*,
                 };
 
+                type PlotLine = ((u8, u8, u8, f64), String, Vec<(usize, f64)>);
+
                 fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
                     _: &BenchConfig,
                     mut builder: ChartBuilder<'_, '_, SVGBackend<'a>>,
                     xrange: X,
                     yrange: Y,
                     plot_id: &mut i32,
-                    lines: Vec<((u8, u8, u8, f64), String, Vec<(usize, f64)>)>,
+                    lines: Vec<PlotLine>,
                 ) where
                     X::CoordDescType: ValueFormatter<X::Value>,
                     Y::CoordDescType: ValueFormatter<Y::Value>,
@@ -1005,8 +1006,8 @@ impl Bench {
                     chart
                         .configure_series_labels()
                         .position(SeriesLabelPosition::UpperLeft)
-                        .background_style(&GREY_A100.mix(0.8))
-                        .border_style(&full_palette::BLACK)
+                        .background_style(GREY_A100.mix(0.8))
+                        .border_style(full_palette::BLACK)
                         .draw()
                         .unwrap();
                 }
@@ -1067,7 +1068,7 @@ impl Bench {
                 }
             }
 
-            if group_arg_plot.len() > 0 {
+            if !group_arg_plot.is_empty() {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Plot(group_arg_plot),
@@ -1406,7 +1407,7 @@ pub mod config {
             let clap = Clap::parse();
 
             let toml: Option<io::Result<Toml>> = clap.config.map(|toml| {
-                toml::de::from_str(&std::fs::read_to_string(&toml)?)
+                toml::de::from_str(&std::fs::read_to_string(toml)?)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             });
             let toml = match toml {
@@ -1615,6 +1616,11 @@ pub mod result {
             }
         }
 
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
         #[track_caller]
         pub fn unwrap_as_named(&self) -> &[String] {
             match self {
@@ -1678,7 +1684,7 @@ pub mod result {
                 Stats::from_slice(&self.timings[arg_idx]),
                 self.metric
                     .as_ref()
-                    .map(|metric| Stats::from_slice(&*metric[arg_idx])),
+                    .map(|metric| Stats::from_slice(&metric[arg_idx])),
             )
         }
     }
