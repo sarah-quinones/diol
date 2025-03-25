@@ -4,7 +4,7 @@
 //! add the following to your `Cargo.toml`.
 //! ```notcode
 //! [dev-dependencies]
-//! diol = "0.6.0"
+//! diol = "0.9"
 //!
 //! [[bench]]
 //! name = "my_benchmark"
@@ -15,7 +15,7 @@
 //! ```rust
 //! use diol::prelude::*;
 //!
-//! fn main() -> std::io::Result<()> {
+//! fn main() -> eyre::Result<()> {
 //!     let mut bench = Bench::new(BenchConfig::from_args()?);
 //!     bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
 //!     bench.run()?;
@@ -70,6 +70,9 @@ use config::*;
 use result::*;
 use traits::{Arg, Register, RegisterMany};
 use variadics::{Cons, Nil};
+
+#[cfg(feature = "plot")]
+mod typst_imp;
 
 // taken from criterion
 fn cargo_target_directory() -> Option<PathBuf> {
@@ -522,7 +525,7 @@ impl Bencher<'_> {
 
 type BencherGroup = (
     Vec<(String, Box<dyn Register<Box<dyn Arg>>>)>,
-    (TypeId, Vec<Box<dyn Arg>>)
+    (TypeId, Vec<Box<dyn Arg>>),
 );
 
 /// main benchmark entry point, used to register functions and arguments, then run benchmarks.
@@ -713,16 +716,13 @@ impl Bench {
 
     /// run the benchmark, and write the results to stdout, and optionally to a file, depending on
     /// the configuration options.
-    pub fn run(&mut self) -> std::io::Result<BenchResult> {
+    pub fn run(&mut self) -> eyre::Result<BenchResult> {
         let config = &self.config;
         let mut result = BenchResult { groups: Vec::new() };
 
         let verbose = config.verbose == StdoutPrint::Verbose;
 
-        #[cfg(feature = "plot")]
         let mut plot_id = 0;
-        #[cfg(feature = "plot")]
-        let plot_name = &config.plot_name.0;
 
         for (group, (type_id, args)) in &mut self.groups {
             let mut nargs = 0;
@@ -761,7 +761,9 @@ impl Bench {
                 continue;
             }
 
-            let is_plot_arg = *type_id == TypeId::of::<PlotArg>();
+            let is_plot_arg =
+                (*type_id == TypeId::of::<PlotArg>()) || (*type_id == TypeId::of::<usize>());
+
             let is_not_time_metric =
                 (*config.plot_metric.0).type_id() != TypeId::of::<TimeMetric>();
             let metric_name = config.plot_metric.0.name().to_string();
@@ -799,20 +801,15 @@ impl Bench {
             let mut group_arg_named = Vec::new();
             let mut group_arg_plot = Vec::new();
 
-            #[cfg(feature = "plot")]
-            let plot_target = config
-                .plot_dir
-                .0
-                .as_ref()
-                .map(|dir| dir.join(format!("{plot_name}_{plot_id}.svg")));
             let mut max_arg = 0usize;
             let mut min_arg = usize::MAX;
             let mut max_y = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;
-            let mut lines = vec![((0u8, 0u8, 0u8, 1.0), String::new(), Vec::new()); group.len()];
 
             for arg in &**args {
-                if (**arg).type_id() == TypeId::of::<PlotArg>() {
+                if (**arg).type_id() == TypeId::of::<PlotArg>()
+                    || arg.type_id() == TypeId::of::<usize>()
+                {
                     let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
                     max_arg = Ord::max(arg.0, max_arg);
                     min_arg = Ord::min(arg.0, min_arg);
@@ -904,8 +901,6 @@ impl Bench {
                     let median = ctx.timings.get(count / 2).copied().unwrap_or_default();
 
                     if is_plot_arg {
-                        assert!((**arg).type_id() == TypeId::of::<PlotArg>());
-
                         let arg = unsafe { &*(&**arg as *const dyn Arg as *const PlotArg) };
                         metric = ctx
                             .timings
@@ -916,23 +911,6 @@ impl Bench {
 
                         max_y = f64::max(max_y, metric_mean);
                         min_y = f64::min(min_y, metric_mean);
-                        let gradient = colorgrad::spectral();
-                        let color = gradient.at(if nfuncs == 0 {
-                            0.5
-                        } else {
-                            idx as f64 / (nfuncs - 1) as f64
-                        });
-
-                        lines[idx].0 = (
-                            (color.r * 255.0) as u8,
-                            (color.g * 255.0) as u8,
-                            (color.b * 255.0) as u8,
-                            1.0,
-                        );
-                        if lines[idx].1.is_empty() {
-                            lines[idx].1 = name.to_string();
-                        }
-                        lines[idx].2.push((arg.0, metric_mean));
                     }
 
                     if verbose {
@@ -957,117 +935,6 @@ impl Bench {
                 }
             }
 
-            #[cfg(feature = "plot")]
-            if let Some(plot_target) = &plot_target {
-                use plotters::{
-                    coord::ranged1d::{AsRangedCoord, ValueFormatter},
-                    element::PointCollection,
-                    prelude::*,
-                    style::full_palette::*,
-                };
-
-                type PlotLine = ((u8, u8, u8, f64), String, Vec<(usize, f64)>);
-
-                fn do_plot<'a, X: AsRangedCoord, Y: AsRangedCoord>(
-                    _: &BenchConfig,
-                    mut builder: ChartBuilder<'_, '_, SVGBackend<'a>>,
-                    xrange: X,
-                    yrange: Y,
-                    plot_id: &mut i32,
-                    lines: Vec<PlotLine>,
-                ) where
-                    X::CoordDescType: ValueFormatter<X::Value>,
-                    Y::CoordDescType: ValueFormatter<Y::Value>,
-                    for<'b> &'b DynElement<'static, SVGBackend<'a>, (f32, f32)>:
-                        PointCollection<'b, (X::Value, Y::Value)>,
-                {
-                    let mut chart = builder.build_cartesian_2d(xrange, yrange).unwrap();
-                    chart.configure_mesh().max_light_lines(2).draw().unwrap();
-                    *plot_id += 1;
-
-                    for (color, name, line) in &lines {
-                        let style = ShapeStyle {
-                            color: RGBAColor(color.0, color.1, color.2, color.3),
-                            filled: false,
-                            stroke_width: 3,
-                        };
-                        chart
-                            .draw_series(LineSeries::new(
-                                line.iter().map(|&(n, metric)| (n as f32, metric as f32)),
-                                style,
-                            ))
-                            .unwrap()
-                            .label(name)
-                            .legend(move |(x, y)| {
-                                PathElement::new(vec![(x + 20, y), (x, y)], style)
-                            });
-                    }
-
-                    chart
-                        .configure_series_labels()
-                        .position(SeriesLabelPosition::UpperLeft)
-                        .background_style(GREY_A100.mix(0.8))
-                        .border_style(full_palette::BLACK)
-                        .draw()
-                        .unwrap();
-                }
-
-                if is_plot_arg {
-                    let root =
-                        SVGBackend::new(plot_target, (config.plot_size.x, config.plot_size.y))
-                            .into_drawing_area();
-                    root.fill(&GREY_300).unwrap();
-                    let mut builder = ChartBuilder::on(&root);
-                    builder
-                        .margin(30)
-                        .x_label_area_size(30)
-                        .y_label_area_size(30);
-
-                    let mut xrange = min_arg as f32..max_arg as f32;
-                    let mut yrange = f32::min(min_y as f32, 0.0f32)..max_y as f32;
-
-                    if xrange.end <= xrange.start {
-                        xrange.end = xrange.start + 1.0;
-                    }
-
-                    if yrange.end <= yrange.start {
-                        yrange.end = 1.0;
-                    }
-
-                    match config.plot_axis {
-                        PlotAxis::Linear => {
-                            do_plot(config, builder, xrange, yrange, &mut plot_id, lines)
-                        }
-                        PlotAxis::SemiLogX => do_plot(
-                            config,
-                            builder,
-                            xrange.log_scale(),
-                            yrange,
-                            &mut plot_id,
-                            lines,
-                        ),
-                        PlotAxis::SemiLogY => do_plot(
-                            config,
-                            builder,
-                            xrange,
-                            yrange.log_scale(),
-                            &mut plot_id,
-                            lines,
-                        ),
-                        PlotAxis::LogLog => do_plot(
-                            config,
-                            builder,
-                            xrange.log_scale(),
-                            yrange.log_scale(),
-                            &mut plot_id,
-                            lines,
-                        ),
-                    }
-
-                    root.present().unwrap();
-                }
-            }
-
             if !group_arg_plot.is_empty() {
                 result.groups.push(BenchGroupResult {
                     function: group_function_result,
@@ -1076,12 +943,21 @@ impl Bench {
                     metric_mono,
                 });
             } else {
-                result.groups.push(BenchGroupResult {
+                let group = BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Named(group_arg_named),
                     metric_name,
                     metric_mono,
-                });
+                };
+                #[cfg(feature = "plot")]
+                if is_plot_arg {
+                    if let Some(plot_dir) = &config.plot_dir.0 {
+                        let name = &config.plot_name.0;
+                        group.plot(&format!("{name}_{plot_id}"), config.plot_axis, plot_dir)?;
+                    }
+                }
+
+                result.groups.push(group);
             }
             if verbose {
                 let mut stdout = std::io::stdout();
@@ -1099,6 +975,7 @@ impl Bench {
                     )?;
                 }
             }
+            plot_id += 1;
         }
 
         if let Some(path) = &config.output {
@@ -1115,8 +992,11 @@ pub mod prelude {
     pub use crate::{
         config::BenchConfig, list, traits::RegisterExt, Bench, Bencher, List, PlotArg,
     };
+    pub use eyre;
     pub use std::hint::black_box;
 }
+pub extern crate eyre;
+pub use eyre::Result;
 
 /// variadic tuple type.
 pub mod variadics {
@@ -1142,8 +1022,6 @@ pub struct PlotArg(pub usize);
 
 /// benchmark configuration
 pub mod config {
-    use std::io;
-
     use super::*;
 
     impl fmt::Debug for PlotArg {
@@ -1324,7 +1202,7 @@ pub mod config {
         }
 
         /// create a configuration from parsed program command-line arguments
-        pub fn from_args() -> io::Result<Self> {
+        pub fn from_args() -> eyre::Result<Self> {
             let mut config = Self::default();
 
             #[derive(clap::ValueEnum, Debug, Clone, Serialize, Deserialize)]
@@ -1406,9 +1284,8 @@ pub mod config {
 
             let clap = Clap::parse();
 
-            let toml: Option<io::Result<Toml>> = clap.config.map(|toml| {
-                toml::de::from_str(&std::fs::read_to_string(toml)?)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            let toml: Option<eyre::Result<Toml>> = clap.config.map(|toml| -> eyre::Result<Toml> {
+                Ok(toml::de::from_str(&std::fs::read_to_string(toml)?)?)
             });
             let toml = match toml {
                 Some(Ok(toml)) => Some(toml),
@@ -1489,8 +1366,7 @@ pub mod config {
                         crate::PlotColors::Cool => PlotColors::Cool,
                     }),
                 };
-                let toml = toml::ser::to_string_pretty(&toml)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let toml = toml::ser::to_string_pretty(&toml)?;
                 std::fs::write(config_out, toml)?;
             }
 
@@ -1711,6 +1587,167 @@ pub mod result {
                 BenchArgs::Plot(arg) => BenchArg::Plot(arg[i]),
             }
         }
+
+        #[cfg(feature = "plot")]
+        pub fn plot(
+            &self,
+            plot_name: &str,
+            axis: PlotAxis,
+            dir: &std::path::Path,
+        ) -> eyre::Result<()> {
+            let group = self;
+            let mut code = String::new();
+            let plot_svg = dir.join(format!("{plot_name}.svg"));
+            let plot_pdf = dir.join(format!("{plot_name}.pdf"));
+
+            let mut max_y = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let metric_name = &group.metric_name;
+
+            match &group.args {
+                BenchArgs::Plot(args) => {
+                    let mut args = args
+                        .iter()
+                        .map(|arg| (false, arg.0 as f64))
+                        .collect::<Vec<_>>();
+
+                    let nfuncs = group.function.len();
+
+                    for (idx, f) in group.function.iter().enumerate() {
+                        let name = &f.name;
+                        let mut line = String::new();
+
+                        for (arg_idx, (keep, arg)) in args.iter_mut().enumerate() {
+                            let metric = &*f.metric.as_ref().unwrap()[arg_idx];
+                            let metric_mean = result::Stats::from_slice(&metric).mean_stddev().0;
+                            if metric_mean.is_finite() {
+                                max_y = f64::max(max_y, metric_mean);
+                                min_y = f64::min(min_y, metric_mean);
+
+                                *keep = true;
+                                let arg = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogX) {
+                                    (*arg).log2()
+                                } else {
+                                    *arg
+                                };
+                                line += &format!("({arg}, {metric_mean}),");
+                            }
+                        }
+                        if !line.is_empty() {
+                            let gradient = colorgrad::spectral();
+                            let color = gradient.at(if nfuncs == 0 {
+                                0.5
+                            } else {
+                                idx as f64 / (nfuncs - 1) as f64
+                            });
+                            let r = (color.r * 255.0) as u8;
+                            let g = (color.g * 255.0) as u8;
+                            let b = (color.b * 255.0) as u8;
+
+                            code += &format!(
+                                "
+plot.add(
+    ({line}),
+    line: \"linear\",
+    label: \"{name}\",
+    mark: \"o\",
+    style: (
+        stroke: (
+            thickness: 2pt,
+            dash: \"solid\",
+            paint: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
+        ),
+    ),
+    mark-style: (
+        stroke: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
+        fill: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
+    ),
+)
+"
+                            );
+                        }
+                    }
+
+                    let args = args
+                        .iter()
+                        .filter(|(keep, _)| *keep)
+                        .map(|(_, arg)| *arg)
+                        .collect::<Vec<_>>();
+
+                    let ticks = args
+                        .iter()
+                        .map(|arg| format!("{arg}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let xmin = args[0];
+                    let xmax = *args.last().unwrap();
+
+                    let (xmin, xmax, ticks) = if matches!(
+                        axis,
+                        PlotAxis::LogLog | PlotAxis::SemiLogX
+                    ) {
+                        (
+                        xmin.log2(),
+                        xmax.log2(),
+                        format!("#let ticks = ({ticks},).map((i) => (calc.log(i, base: 2), rotate(-45deg, reflow: true)[#i]));"),
+                    )
+                    } else {
+                        (
+                        xmin,
+                        xmax,
+                        format!("#let ticks = ({ticks},).map((i) => (i, rotate(-45deg, reflow: true)[#i]));"),
+                    )
+                    };
+
+                    let log = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
+                        "log"
+                    } else {
+                        "lin"
+                    };
+
+                    let source = format!(
+                        r###"
+#import "@preview/cetz:0.3.4"
+#import "@preview/cetz-plot:0.1.1"
+
+#set text(14pt)
+#align(center + horizon)[
+
+{ticks}
+
+#cetz.canvas({{
+import cetz.draw: *
+import cetz-plot: *
+
+plot.plot(size: (16,8),
+    x-format: plot.formats.sci,
+    y-format: plot.formats.sci,
+    legend: (0.5, 7.5),
+    legend-anchor: "north-west",
+    x-mode: "lin", y-mode: "{log}", y-base: 2,
+    y-grid: true,
+    x-min: {xmin}, x-max: {xmax},
+    y-min: {min_y} / 1.125, y-max: {max_y} * 1.125,
+    x-ticks: ticks,
+    x-tick-step: none, y-tick-step: 1.0, y-minor-tick-step: 0.2, 
+    x-label: "input", y-label: "{metric_name}",
+{{
+    {code}
+}})
+}})
+]
+"###
+                    );
+                    use typst_imp::*;
+                    let (svg, pdf) = TypstCompiler::new().compile(&source).unwrap();
+                    std::fs::write(plot_svg, svg)?;
+                    std::fs::write(plot_pdf, pdf)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
     }
 
     impl BenchResult {
@@ -1724,6 +1761,50 @@ pub mod result {
         ) -> (&Stats<Picoseconds>, Option<&Stats<f64>>) {
             equator::assert!(group_idx < self.groups.len());
             self.groups[group_idx].at(Func(func_idx), Arg(arg_idx))
+        }
+
+        pub fn combine(&self, other: &Self) -> Self {
+            BenchResult {
+                groups: core::iter::zip(&self.groups, &other.groups)
+                    .map(|(left, right)| {
+                        assert_eq!(left.args, right.args);
+                        assert_eq!(left.metric_name, right.metric_name);
+                        assert_eq!(left.metric_mono, right.metric_mono);
+
+                        let mut set = std::collections::HashSet::new();
+
+                        for f in &left.function {
+                            set.insert(&*f.name);
+                        }
+                        let mut function = left.function.clone();
+                        for f in &right.function {
+                            if !set.contains(&*f.name) {
+                                function.push(f.clone());
+                            }
+                        }
+
+                        BenchGroupResult {
+                            function,
+                            args: left.args.clone(),
+                            metric_name: left.metric_name.clone(),
+                            metric_mono: left.metric_mono.clone(),
+                        }
+                    })
+                    .collect(),
+            }
+        }
+
+        #[cfg(feature = "plot")]
+        pub fn plot(
+            &self,
+            plot_name: &str,
+            axis: PlotAxis,
+            dir: &std::path::Path,
+        ) -> eyre::Result<()> {
+            for (plot_id, group) in self.groups.iter().enumerate() {
+                group.plot(&format!("{plot_name}_{plot_id}.svg"), axis, dir)?;
+            }
+            Ok(())
         }
     }
 }

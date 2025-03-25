@@ -1,6 +1,7 @@
 use diol::prelude::*;
+use eyre::Result;
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
     bench.run()?;
