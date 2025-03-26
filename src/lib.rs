@@ -127,10 +127,10 @@ struct TimeMetric;
 
 impl traits::PlotMetric for TimeMetric {
     fn name(&self) -> &'static str {
-        "time (s)"
+        "time (μs)"
     }
     fn compute(&self, _: PlotArg, time: Picoseconds) -> f64 {
-        time.0 as f64 / 1e12
+        time.0 as f64 / 1e6
     }
 
     fn monotonicity(&self) -> traits::Monotonicity {
@@ -936,19 +936,13 @@ impl Bench {
             }
 
             if !group_arg_plot.is_empty() {
-                result.groups.push(BenchGroupResult {
+                let group = BenchGroupResult {
                     function: group_function_result,
                     args: BenchArgs::Plot(group_arg_plot),
                     metric_name,
                     metric_mono,
-                });
-            } else {
-                let group = BenchGroupResult {
-                    function: group_function_result,
-                    args: BenchArgs::Named(group_arg_named),
-                    metric_name,
-                    metric_mono,
                 };
+
                 #[cfg(feature = "plot")]
                 if is_plot_arg {
                     if let Some(plot_dir) = &config.plot_dir.0 {
@@ -957,6 +951,14 @@ impl Bench {
                     }
                 }
 
+                result.groups.push(group);
+            } else {
+                let group = BenchGroupResult {
+                    function: group_function_result,
+                    args: BenchArgs::Named(group_arg_named),
+                    metric_name,
+                    metric_mono,
+                };
                 result.groups.push(group);
             }
             if verbose {
@@ -1044,10 +1046,10 @@ pub mod config {
     /// kind of a plot axis.
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
     pub enum PlotAxis {
-        #[default]
         Linear,
         SemiLogX,
         SemiLogY,
+        #[default]
         LogLog,
     }
 
@@ -1688,16 +1690,16 @@ plot.add(
                         PlotAxis::LogLog | PlotAxis::SemiLogX
                     ) {
                         (
-                        xmin.log2(),
-                        xmax.log2(),
-                        format!("#let ticks = ({ticks},).map((i) => (calc.log(i, base: 2), rotate(-45deg, reflow: true)[#i]));"),
-                    )
+                            xmin.log2(),
+                            xmax.log2(),
+                            format!("#let ticks = ({ticks},).map((i) => (calc.log(i, base: 2), rotate(-45deg, reflow: true)[#i]));"),
+                        )
                     } else {
                         (
-                        xmin,
-                        xmax,
-                        format!("#let ticks = ({ticks},).map((i) => (i, rotate(-45deg, reflow: true)[#i]));"),
-                    )
+                            xmin,
+                            xmax,
+                            format!("#let ticks = ({ticks},).map((i) => (i, rotate(-45deg, reflow: true)[#i]));"),
+                        )
                     };
 
                     let log = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {

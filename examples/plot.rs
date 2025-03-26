@@ -5,7 +5,7 @@ fn main() -> Result<()> {
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
         list![slice_times_two, slice_times_two_autovec],
-        [4, 8, 16, 128, 1024].map(PlotArg),
+        [4, 8, 16, 128, 1024, 2048, 4096].map(PlotArg),
     );
     bench.run()?;
     Ok(())
