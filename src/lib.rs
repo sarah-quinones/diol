@@ -4,7 +4,7 @@
 //! add the following to your `Cargo.toml`.
 //! ```notcode
 //! [dev-dependencies]
-//! diol = "0.9"
+//! diol = "0.10"
 //!
 //! [[bench]]
 //! name = "my_benchmark"
@@ -59,6 +59,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     any::{Any, TypeId},
+    cell::RefCell,
     fmt,
     io::Write,
     path::PathBuf,
@@ -302,11 +303,31 @@ macro_rules! __list_impl {
     };
 }
 
-/// create or destructure a variadic tuple containing the given values.
+/// create a variadic tuple containing the given values.
 #[macro_export]
 macro_rules! list {
-    ($($t:tt)*) => {
-        $crate::__list_impl![@ __impl @ () @ ($($t)*)]
+    () => {
+        $crate::variadics::Nil
+    };
+    ($head: expr $(, $tail: expr)* $(,)?) => {
+        $crate::variadics::Cons {
+            head: $head,
+            tail: $crate::list!($($tail,)*)
+        }
+    };
+}
+
+/// destructure a variadic tuple containing the given values.
+#[macro_export]
+macro_rules! unlist {
+    () => {
+        $crate::variadics::Nil
+    };
+    ($head: pat $(, $tail: pat)* $(,)?) => {
+        $crate::variadics::Cons {
+            head: $head,
+            tail: $crate::unlist!($($tail,)*)
+        }
     };
 }
 
@@ -531,7 +552,7 @@ type BencherGroup = (
 /// main benchmark entry point, used to register functions and arguments, then run benchmarks.
 pub struct Bench {
     pub config: BenchConfig,
-    pub groups: Vec<BencherGroup>,
+    pub groups: RefCell<Vec<BencherGroup>>,
 }
 
 impl<T> traits::RegisterMany<T> for Nil {
@@ -661,24 +682,25 @@ impl Bench {
     pub fn new(config: impl AsRef<BenchConfig>) -> Self {
         Self {
             config: config.as_ref().clone(),
-            groups: Vec::new(),
+            groups: RefCell::new(Vec::new()),
         }
     }
 
     #[doc(hidden)]
     pub unsafe fn register_many_dyn(
-        &mut self,
+        &self,
         names: Vec<String>,
         boxed: Vec<Box<dyn Register<Box<dyn Arg>>>>,
         type_id: TypeId,
         args: Vec<Box<dyn Arg>>,
     ) {
         self.groups
+            .borrow_mut()
             .push((std::iter::zip(names, boxed).collect(), (type_id, args)))
     }
 
     fn register_many_with_names<T: Arg, F: traits::RegisterMany<T>>(
-        &mut self,
+        &self,
         names: Vec<String>,
         f: F,
         args: impl IntoIterator<Item = T>,
@@ -686,7 +708,7 @@ impl Bench {
         let mut boxed = Vec::new();
         traits::RegisterMany::push_self(f, &mut boxed);
 
-        self.groups.push((
+        self.groups.borrow_mut().push((
             std::iter::zip(names, boxed).collect(),
             (
                 TypeId::of::<T>(),
@@ -700,7 +722,7 @@ impl Bench {
     /// register multiple functions that should be compared against each other during benchmarking,
     /// all taking the same arguments.
     pub fn register_many<T: Arg>(
-        &mut self,
+        &self,
         f: impl RegisterMany<T>,
         args: impl IntoIterator<Item = T>,
     ) {
@@ -716,7 +738,7 @@ impl Bench {
 
     /// run the benchmark, and write the results to stdout, and optionally to a file, depending on
     /// the configuration options.
-    pub fn run(&mut self) -> eyre::Result<BenchResult> {
+    pub fn run(&self) -> eyre::Result<BenchResult> {
         let config = &self.config;
         let mut result = BenchResult { groups: Vec::new() };
 
@@ -724,7 +746,7 @@ impl Bench {
 
         let mut plot_id = 0;
 
-        for (group, (type_id, args)) in &mut self.groups {
+        for (group, (type_id, args)) in &mut *self.groups.borrow_mut() {
             let mut nargs = 0;
             let mut nfuncs = 0;
             let mut max_name_len = 14;
@@ -1088,6 +1110,28 @@ pub mod config {
         /// create a new metric from the given metric function.
         pub fn new(metric: impl traits::PlotMetric) -> Self {
             Self(Box::new(metric))
+        }
+
+        /// change the name of the plot metric.
+        pub fn with_name(self, name: &str) -> Self {
+            #[derive(Clone)]
+            struct Wrap(PlotMetric, String);
+
+            impl traits::PlotMetric for Wrap {
+                fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64 {
+                    self.0 .0.compute(arg, time)
+                }
+
+                fn monotonicity(&self) -> Monotonicity {
+                    self.0 .0.monotonicity()
+                }
+
+                fn name(&self) -> &str {
+                    &self.1
+                }
+            }
+
+            Self::new(Wrap(self, name.to_string()))
         }
     }
 
@@ -1832,8 +1876,8 @@ mod tests {
 
     #[test]
     fn test_list() {
-        let list![_, _, _,]: List![i32, u32, usize] = list![1, 2, 3,];
-        let list![_, _, _]: List![i32, u32, usize] = list![1, 2, 3];
+        let unlist![_, _, _,]: List![i32, u32, usize] = list![1, 2, 3,];
+        let unlist![_, _, _]: List![i32, u32, usize] = list![1, 2, 3];
         println!("{:?}", list![1, 3, vec![1.0]]);
     }
 
@@ -1855,7 +1899,7 @@ mod tests {
 
     #[test]
     fn test_bench() {
-        let mut bench = Bench::new(BenchConfig {
+        let bench = Bench::new(BenchConfig {
             plot_axis: PlotAxis::LogLog,
             min_time: MinTime(Duration::from_millis(100)),
             max_time: MaxTime(Duration::from_millis(100)),
