@@ -817,8 +817,6 @@ impl Bench {
 
         let verbose = config.verbose == StdoutPrint::Verbose;
 
-        let mut plot_id = 0;
-
         for (group_name, (group, (type_id, args))) in &mut *self.groups.borrow_mut() {
             if config
                 .group_filter
@@ -1059,8 +1057,7 @@ impl Bench {
                 #[cfg(feature = "plot")]
                 if is_plot_arg {
                     if let Some(plot_dir) = &config.plot_dir.0 {
-                        let name = &config.plot_name.0;
-                        group.plot(&format!("{name}_{plot_id}"), config.plot_axis, plot_dir)?;
+                        group.plot(&format!("{group_name}"), config.plot_axis, plot_dir)?;
                     }
                 }
 
@@ -1091,7 +1088,6 @@ impl Bench {
                     )?;
                 }
             }
-            plot_id += 1;
         }
 
         if let Some(path) = &config.output {
@@ -1334,7 +1330,6 @@ pub mod config {
         pub verbose: StdoutPrint,
         pub plot_size: PlotSize,
         pub plot_axis: PlotAxis,
-        pub plot_name: PlotName,
         pub plot_metric: PlotMetric,
         pub plot_dir: PlotDir,
         pub plot_colors: PlotColors,
@@ -1875,7 +1870,7 @@ plot.add(
 #import "@preview/cetz:0.3.4"
 #import "@preview/cetz-plot:0.1.1"
 
-#set text(14pt)
+#set text(14pt, font: "New Computer Modern Math")
 #align(center + horizon)[
 
 {ticks}
@@ -1887,14 +1882,12 @@ import cetz-plot: *
 plot.plot(size: (16,12),
     x-format: plot.formats.sci,
     y-format: plot.formats.sci,
-    legend: (16, 0.0),
-    legend-anchor: "south-east",
     x-mode: "lin", y-mode: "{log}", y-base: 2,
     y-grid: true,
     x-min: {xmin}, x-max: {xmax},
     y-max: {max_y} * 1.125,
     x-ticks: ticks,
-    x-tick-step: none, y-tick-step: {diff} / 10.0, y-minor-tick-step: {diff} / 40.0, 
+    x-tick-step: none, y-tick-step: {diff} / 10.0, y-minor-tick-step: 0.2, 
     x-label: "input", y-label: "{metric_name}",
 {{
     {code}
@@ -1918,23 +1911,36 @@ plot.plot(size: (16,12),
             axis: PlotAxis,
             dir: &std::path::Path,
         ) -> eyre::Result<()> {
+            use std::process::Stdio;
+
             let plot_svg = dir.join(format!("{plot_name}.svg"));
             let plot_pdf = dir.join(format!("{plot_name}.pdf"));
 
             if let Some(source) = self.plot_typst(plot_name, axis) {
-                let svg_ok = std::process::Command::new("typst")
+                let source_raw = typst_imp::templates::raw(&source);
+                let mut svg = std::process::Command::new("typst")
                     .arg("compile")
                     .arg("-")
                     .arg(&plot_svg)
-                    .output()
-                    .is_ok();
+                    .stdin(Stdio::piped())
+                    .spawn()?;
+                svg.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(source_raw.as_bytes())?;
+                let svg_ok = svg.wait_with_output().is_ok();
 
-                let pdf_ok = std::process::Command::new("typst")
+                let mut pdf = std::process::Command::new("typst")
                     .arg("compile")
                     .arg("-")
                     .arg(&plot_pdf)
-                    .output()
-                    .is_ok();
+                    .stdin(Stdio::piped())
+                    .spawn()?;
+                pdf.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(source_raw.as_bytes())?;
+                let pdf_ok = pdf.wait_with_output().is_ok();
 
                 if !svg_ok || !pdf_ok {
                     use typst_imp::*;

@@ -13,7 +13,7 @@ use typst::{
     Library, World,
 };
 
-mod templates;
+pub mod templates;
 
 pub trait MathCompiler {
     fn compile(&self, input: &str) -> Result<(String, Vec<u8>)>;
