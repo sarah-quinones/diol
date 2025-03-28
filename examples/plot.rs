@@ -2,7 +2,7 @@ use diol::prelude::*;
 use eyre::Result;
 
 fn main() -> Result<()> {
-    let bench = Bench::new(BenchConfig::from_args()?);
+    let bench = Bench::new(Config::from_args()?);
     bench.register_many(
         "slice × 2",
         list![slice_times_two, slice_times_two_autovec],

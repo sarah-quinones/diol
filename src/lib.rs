@@ -508,7 +508,7 @@ struct BenchCtx {
 /// bench loop runner.
 pub struct Bencher<'a> {
     ctx: &'a mut BenchCtx,
-    config: &'a BenchConfig,
+    config: &'a Config,
 }
 
 #[inline]
@@ -602,7 +602,7 @@ type BencherGroup = (
 
 /// main benchmark entry point, used to register functions and arguments, then run benchmarks.
 pub struct Bench {
-    pub config: BenchConfig,
+    pub config: Config,
     pub groups: RefCell<HashMap<String, BencherGroup>>,
 }
 
@@ -722,15 +722,15 @@ impl<T: Arg, Head: Register<T>, Tail: traits::RegisterMany<T>> traits::RegisterM
     }
 }
 
-impl AsRef<BenchConfig> for BenchConfig {
-    fn as_ref(&self) -> &BenchConfig {
+impl AsRef<Config> for Config {
+    fn as_ref(&self) -> &Config {
         self
     }
 }
 
 impl Bench {
     /// create a bench object from the given configuration.
-    pub fn new(config: impl AsRef<BenchConfig>) -> Self {
+    pub fn new(config: impl AsRef<Config>) -> Self {
         Self {
             config: config.as_ref().clone(),
             groups: RefCell::new(HashMap::new()),
@@ -740,7 +740,7 @@ impl Bench {
     /// create a bench object from the given configuration.
     pub fn from_args() -> Result<Self> {
         Ok(Self {
-            config: BenchConfig::from_args()?,
+            config: Config::from_args()?,
             groups: RefCell::new(HashMap::new()),
         })
     }
@@ -875,9 +875,28 @@ impl Bench {
                 let mut stdout = std::io::stdout();
                 let mut stdout = LineFormatter::new(&mut stdout, config.lines);
                 if is_plot_arg && is_not_time_metric {
+                    let len = 1
+                        + max_name_len
+                        + 1
+                        + max_arg_len
+                        + 2
+                        + metric_len
+                        + 3
+                        + 9
+                        + 3
+                        + 9
+                        + 3
+                        + 9
+                        + 3
+                        + 9
+                        + 1;
+
+                    writeln!(stdout, "╭{:─<len$}╮", "")?;
+                    writeln!(stdout, "│{group_name:^len$}│")?;
+
                     writeln!(
                         stdout,
-                        "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬{:─>metric_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
+                        "├─{:─<max_name_len$}┬{:─>max_arg_len$}─┬{:─>metric_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┤",
                         "", "", "", "", "", "", "",
                     )?;
                     writeln!(
@@ -1057,7 +1076,7 @@ impl Bench {
                 #[cfg(feature = "plot")]
                 if is_plot_arg {
                     if let Some(plot_dir) = &config.plot_dir.0 {
-                        group.plot(&format!("{group_name}"), config.plot_axis, plot_dir)?;
+                        group.plot(&format!("{group_name}"), config, plot_dir)?;
                     }
                 }
 
@@ -1101,9 +1120,7 @@ impl Bench {
 
 /// re-exports of useful types and traits.
 pub mod prelude {
-    pub use crate::{
-        config::BenchConfig, list, traits::RegisterExt, Bench, Bencher, List, PlotArg,
-    };
+    pub use crate::{config::Config, list, traits::RegisterExt, Bench, Bencher, List, PlotArg};
     pub use eyre;
     pub use std::hint::black_box;
 }
@@ -1305,12 +1322,17 @@ pub mod config {
     }
 
     /// colors to use for the generated plot
-    #[derive(Debug, Clone, Default)]
+    #[derive(clap::ValueEnum, Debug, Copy, Clone, Serialize, Deserialize, Default)]
+    #[clap(rename_all = "kebab_case")]
+    #[serde(rename_all = "kebab-case")]
     pub enum PlotColors {
+        #[default]
+        Tableau10,
+        Tableau20,
+
         CubehelixDefault,
         Turbo,
         Spectral,
-        #[default]
         Viridis,
         Magma,
         Inferno,
@@ -1322,7 +1344,7 @@ pub mod config {
 
     /// benchmark configuration.
     #[derive(Debug, Clone, Default)]
-    pub struct BenchConfig {
+    pub struct Config {
         pub sample_count: SampleCount,
         pub iter_count: ItersPerSample,
         pub min_time: MinTime,
@@ -1340,7 +1362,7 @@ pub mod config {
         pub lines: Lines,
     }
 
-    impl BenchConfig {
+    impl Config {
         /// create a default configuration
         pub fn new() -> Self {
             Default::default()
@@ -1349,22 +1371,6 @@ pub mod config {
         /// create a configuration from parsed program command-line arguments
         pub fn from_args() -> eyre::Result<Self> {
             let mut config = Self::default();
-
-            #[derive(clap::ValueEnum, Debug, Clone, Serialize, Deserialize)]
-            #[clap(rename_all = "kebab_case")]
-            #[serde(rename_all = "kebab-case")]
-            enum PlotColors {
-                CubehelixDefault,
-                Turbo,
-                Spectral,
-                Viridis,
-                Magma,
-                Inferno,
-                Plasma,
-                Cividis,
-                Warm,
-                Cool,
-            }
 
             #[derive(Serialize, Deserialize)]
             struct Toml {
@@ -1480,18 +1486,7 @@ pub mod config {
                 config.output = Some(output);
             };
             if let (Some(colors), _) | (None, Some(colors)) = (clap.colors, toml.colors) {
-                config.plot_colors = match colors {
-                    PlotColors::CubehelixDefault => crate::PlotColors::CubehelixDefault,
-                    PlotColors::Turbo => crate::PlotColors::Turbo,
-                    PlotColors::Spectral => crate::PlotColors::Spectral,
-                    PlotColors::Viridis => crate::PlotColors::Viridis,
-                    PlotColors::Magma => crate::PlotColors::Magma,
-                    PlotColors::Inferno => crate::PlotColors::Inferno,
-                    PlotColors::Plasma => crate::PlotColors::Plasma,
-                    PlotColors::Cividis => crate::PlotColors::Cividis,
-                    PlotColors::Warm => crate::PlotColors::Warm,
-                    PlotColors::Cool => crate::PlotColors::Cool,
-                };
+                config.plot_colors = colors;
             }
 
             if let (Some(lines), _) | (None, Some(lines)) = (clap.lines, toml.lines) {
@@ -1516,18 +1511,7 @@ pub mod config {
                     quiet: Some(config.verbose == StdoutPrint::Quiet),
                     output: config.output.clone(),
                     plot_dir: config.plot_dir.0.clone(),
-                    colors: Some(match config.plot_colors {
-                        crate::PlotColors::CubehelixDefault => PlotColors::CubehelixDefault,
-                        crate::PlotColors::Turbo => PlotColors::Turbo,
-                        crate::PlotColors::Spectral => PlotColors::Spectral,
-                        crate::PlotColors::Viridis => PlotColors::Viridis,
-                        crate::PlotColors::Magma => PlotColors::Magma,
-                        crate::PlotColors::Inferno => PlotColors::Inferno,
-                        crate::PlotColors::Plasma => PlotColors::Plasma,
-                        crate::PlotColors::Cividis => PlotColors::Cividis,
-                        crate::PlotColors::Warm => PlotColors::Warm,
-                        crate::PlotColors::Cool => PlotColors::Cool,
-                    }),
+                    colors: Some(config.plot_colors),
                     lines: Some(config.lines),
                 };
                 let toml = toml::ser::to_string_pretty(&toml)?;
@@ -1755,7 +1739,7 @@ pub mod result {
         }
 
         #[cfg(feature = "plot")]
-        pub fn plot_typst(&self, plot_name: &str, axis: PlotAxis) -> Option<String> {
+        pub fn plot_typst(&self, plot_name: &str, config: &Config) -> Option<String> {
             let group = self;
             let mut code = String::new();
 
@@ -1775,33 +1759,104 @@ pub mod result {
                     for (idx, f) in group.function.iter().enumerate() {
                         let name = &f.name;
                         let mut line = String::new();
+                        let mut lower2 = String::new();
+                        let mut lower1 = String::new();
+                        let mut upper1 = String::new();
+                        let mut upper2 = String::new();
 
                         for (arg_idx, (keep, arg)) in args.iter_mut().enumerate() {
                             let metric = &*f.metric.as_ref().unwrap()[arg_idx];
-                            let metric_mean = result::Stats::from_slice(&metric).mean_stddev().0;
-                            if metric_mean.is_finite() {
-                                max_y = f64::max(max_y, metric_mean);
-                                min_y = f64::min(min_y, metric_mean);
+                            let (mean, mut stddev) =
+                                result::Stats::from_slice(&metric).mean_stddev();
+                            if stddev.is_nan() {
+                                stddev = 0.0;
+                            }
+
+                            if mean.is_finite() {
+                                max_y = f64::max(max_y, mean + 3.0 * stddev);
+                                min_y = f64::min(min_y, mean - 3.0 * stddev);
 
                                 *keep = true;
-                                let arg = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogX) {
+                                let arg = if matches!(
+                                    config.plot_axis,
+                                    PlotAxis::LogLog | PlotAxis::SemiLogX
+                                ) {
                                     (*arg).log2()
                                 } else {
                                     *arg
                                 };
-                                line += &format!("({arg}, {metric_mean}),");
+                                line += &format!("({arg}, {mean}),");
+                                lower1 += &format!("({arg}, {}),", mean - 1.0 * stddev);
+                                upper1 += &format!("({arg}, {}),", mean + 1.0 * stddev);
+                                lower2 += &format!("({arg}, {}),", mean - 2.0 * stddev);
+                                upper2 += &format!("({arg}, {}),", mean + 2.0 * stddev);
                             }
                         }
                         if !line.is_empty() {
-                            let gradient = colorgrad::spectral();
-                            let color = gradient.at(if nfuncs == 0 {
-                                0.5
-                            } else {
-                                idx as f64 / (nfuncs - 1) as f64
-                            });
-                            let r = (color.r * 255.0) as u8;
-                            let g = (color.g * 255.0) as u8;
-                            let b = (color.b * 255.0) as u8;
+                            let from_colorgrad = |c: colorgrad::Gradient| {
+                                let color = c.at(if nfuncs == 0 {
+                                    0.5
+                                } else {
+                                    idx as f64 / (nfuncs - 1) as f64
+                                });
+                                let r = (color.r * 255.0) as u8;
+                                let g = (color.g * 255.0) as u8;
+                                let b = (color.b * 255.0) as u8;
+
+                                (r, g, b)
+                            };
+
+                            let (r, g, b) = match config.plot_colors {
+                                PlotColors::CubehelixDefault => {
+                                    from_colorgrad(colorgrad::cubehelix_default())
+                                }
+                                PlotColors::Turbo => from_colorgrad(colorgrad::turbo()),
+                                PlotColors::Spectral => from_colorgrad(colorgrad::spectral()),
+                                PlotColors::Viridis => from_colorgrad(colorgrad::viridis()),
+                                PlotColors::Magma => from_colorgrad(colorgrad::magma()),
+                                PlotColors::Inferno => from_colorgrad(colorgrad::inferno()),
+                                PlotColors::Plasma => from_colorgrad(colorgrad::plasma()),
+                                PlotColors::Cividis => from_colorgrad(colorgrad::cividis()),
+                                PlotColors::Warm => from_colorgrad(colorgrad::warm()),
+                                PlotColors::Cool => from_colorgrad(colorgrad::cool()),
+                                PlotColors::Tableau20 => [
+                                    (31, 119, 180),
+                                    (174, 199, 232),
+                                    (255, 127, 14),
+                                    (255, 187, 120),
+                                    (44, 160, 44),
+                                    (152, 223, 138),
+                                    (214, 39, 40),
+                                    (255, 152, 150),
+                                    (148, 103, 189),
+                                    (197, 176, 213),
+                                    (140, 86, 75),
+                                    (196, 156, 148),
+                                    (227, 119, 194),
+                                    (247, 182, 210),
+                                    (127, 127, 127),
+                                    (199, 199, 199),
+                                    (188, 189, 34),
+                                    (219, 219, 141),
+                                    (23, 190, 207),
+                                    (158, 218, 229),
+                                ][idx % 20],
+                                PlotColors::Tableau10 => [
+                                    (0x4E, 0x79, 0xA7),
+                                    (0xF2, 0x8E, 0x2B),
+                                    (0xE1, 0x57, 0x59),
+                                    (0x59, 0xA1, 0x4F),
+                                    (0xED, 0xC9, 0x48),
+                                    (0xB0, 0x7A, 0xA1),
+                                    (0xFF, 0x9D, 0xA7),
+                                    (0x9C, 0x75, 0x5F),
+                                    (0xBA, 0xB0, 0xAC),
+                                    (0x76, 0xB7, 0xB2),
+                                ][idx % 10],
+                            };
+
+                            let color = format!("rgb(\"#{r:02x}{g:02x}{b:02x}\")");
+                            let color_trans = format!("rgb(\"#{r:02x}{g:02x}{b:02x}30\")");
 
                             code += &format!(
                                 "
@@ -1814,16 +1869,37 @@ plot.add(
         stroke: (
             thickness: 2pt,
             dash: \"solid\",
-            paint: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
+            paint: {color},
         ),
     ),
     mark-style: (
-        stroke: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
-        fill: rgb(\"#{r:02x}{g:02x}{b:02x}\"),
+        stroke: {color},
+        fill: {color},
     ),
 )
 "
                             );
+
+                            for (lower, upper) in [(&lower1, &upper1), (&lower2, &upper2)] {
+                                code += &format!(
+                                    "
+plot.add-fill-between(
+    ({lower}),
+    ({upper}),
+    line: \"linear\",
+    style: (
+        fill: {color_trans},
+
+        stroke: (
+            thickness: 0pt,
+            dash: \"solid\",
+            paint: {color_trans},
+        ),
+    ),
+)
+"
+                                );
+                            }
                         }
                     }
 
@@ -1843,7 +1919,7 @@ plot.add(
                     let xmax = *args.last().unwrap();
 
                     let (xmin, xmax, ticks) = if matches!(
-                        axis,
+                        config.plot_axis,
                         PlotAxis::LogLog | PlotAxis::SemiLogX
                     ) {
                         (
@@ -1859,11 +1935,12 @@ plot.add(
                         )
                     };
 
-                    let (log, diff) = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
-                        ("log", f64::log2(max_y) - f64::log2(min_y))
-                    } else {
-                        ("lin", max_y - min_y)
-                    };
+                    let (log, diff) =
+                        if matches!(config.plot_axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
+                            ("log", f64::log2(max_y) - f64::log2(min_y))
+                        } else {
+                            ("lin", max_y - min_y)
+                        };
 
                     let source = format!(
                         r###"
@@ -1908,7 +1985,7 @@ plot.plot(size: (16,12),
         pub fn plot(
             &self,
             plot_name: &str,
-            axis: PlotAxis,
+            config: &Config,
             dir: &std::path::Path,
         ) -> eyre::Result<()> {
             use std::process::Stdio;
@@ -1916,7 +1993,7 @@ plot.plot(size: (16,12),
             let plot_svg = dir.join(format!("{plot_name}.svg"));
             let plot_pdf = dir.join(format!("{plot_name}.pdf"));
 
-            if let Some(source) = self.plot_typst(plot_name, axis) {
+            if let Some(source) = self.plot_typst(plot_name, config) {
                 let source_raw = typst_imp::templates::raw(&source);
                 let mut svg = std::process::Command::new("typst")
                     .arg("compile")
@@ -1997,9 +2074,9 @@ plot.plot(size: (16,12),
         }
 
         #[cfg(feature = "plot")]
-        pub fn plot(&self, axis: PlotAxis, dir: &std::path::Path) -> eyre::Result<()> {
+        pub fn plot(&self, config: &Config, dir: &std::path::Path) -> eyre::Result<()> {
             for (name, group) in self.groups.iter() {
-                group.plot(&format!("{name}"), axis, dir)?;
+                group.plot(&format!("{name}"), config, dir)?;
             }
             Ok(())
         }
@@ -2050,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_bench() -> eyre::Result<()> {
-        let bench = Bench::new(BenchConfig {
+        let bench = Bench::new(Config {
             plot_axis: PlotAxis::LogLog,
             min_time: MinTime(Duration::from_millis(100)),
             max_time: MaxTime(Duration::from_millis(100)),
