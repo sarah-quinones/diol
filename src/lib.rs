@@ -4,7 +4,7 @@
 //! add the following to your `Cargo.toml`.
 //! ```notcode
 //! [dev-dependencies]
-//! diol = "0.10"
+//! diol = "0.11"
 //!
 //! [[bench]]
 //! name = "my_benchmark"
@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
+    collections::HashMap,
     fmt,
     io::Write,
     path::PathBuf,
@@ -93,6 +94,56 @@ fn cargo_target_directory() -> Option<PathBuf> {
             let metadata: Metadata = serde_json::from_slice(&output.stdout).ok()?;
             Some(metadata.target_directory)
         })
+}
+
+struct LineFormatter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    lines: Lines,
+}
+
+impl<'a> LineFormatter<'a> {
+    fn new(inner: &'a mut dyn std::io::Write, lines: Lines) -> Self {
+        Self { inner, lines }
+    }
+}
+
+impl std::io::Write for LineFormatter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.lines {
+            Lines::No => {
+                let mut len = 0;
+
+                for chunk in buf.utf8_chunks() {
+                    let replace = chunk.valid().replace(
+                        |c: char| {
+                            ['╰', '─', '┴', '╯', '│', '├', '┼', '┤', '╭', '┬', '╮'].contains(&c)
+                        },
+                        " ",
+                    );
+                    let written = self.inner.write((&replace).as_bytes())?;
+                    if written == replace.len() {
+                        len += chunk.valid().len();
+                    } else {
+                        break;
+                    }
+
+                    let written = self.inner.write(chunk.invalid())?;
+                    if written == chunk.invalid().len() {
+                        len += written;
+                    } else {
+                        break;
+                    }
+                }
+
+                Ok(len)
+            }
+            Lines::Yes => self.inner.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 // taken from the stdlib
@@ -552,7 +603,7 @@ type BencherGroup = (
 /// main benchmark entry point, used to register functions and arguments, then run benchmarks.
 pub struct Bench {
     pub config: BenchConfig,
-    pub groups: RefCell<Vec<BencherGroup>>,
+    pub groups: RefCell<HashMap<String, BencherGroup>>,
 }
 
 impl<T> traits::RegisterMany<T> for Nil {
@@ -682,25 +733,36 @@ impl Bench {
     pub fn new(config: impl AsRef<BenchConfig>) -> Self {
         Self {
             config: config.as_ref().clone(),
-            groups: RefCell::new(Vec::new()),
+            groups: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// create a bench object from the given configuration.
+    pub fn from_args() -> Result<Self> {
+        Ok(Self {
+            config: BenchConfig::from_args()?,
+            groups: RefCell::new(HashMap::new()),
+        })
     }
 
     #[doc(hidden)]
     pub unsafe fn register_many_dyn(
         &self,
+        group: &str,
         names: Vec<String>,
         boxed: Vec<Box<dyn Register<Box<dyn Arg>>>>,
         type_id: TypeId,
         args: Vec<Box<dyn Arg>>,
     ) {
-        self.groups
-            .borrow_mut()
-            .push((std::iter::zip(names, boxed).collect(), (type_id, args)))
+        self.groups.borrow_mut().insert(
+            group.to_string(),
+            (std::iter::zip(names, boxed).collect(), (type_id, args)),
+        );
     }
 
     fn register_many_with_names<T: Arg, F: traits::RegisterMany<T>>(
         &self,
+        group: &str,
         names: Vec<String>,
         f: F,
         args: impl IntoIterator<Item = T>,
@@ -708,45 +770,64 @@ impl Bench {
         let mut boxed = Vec::new();
         traits::RegisterMany::push_self(f, &mut boxed);
 
-        self.groups.borrow_mut().push((
-            std::iter::zip(names, boxed).collect(),
+        self.groups.borrow_mut().insert(
+            group.to_string(),
             (
-                TypeId::of::<T>(),
-                args.into_iter()
-                    .map(|arg| Box::new(arg) as Box<dyn Arg>)
-                    .collect(),
+                std::iter::zip(names, boxed).collect(),
+                (
+                    TypeId::of::<T>(),
+                    args.into_iter()
+                        .map(|arg| Box::new(arg) as Box<dyn Arg>)
+                        .collect(),
+                ),
             ),
-        ));
+        );
     }
 
     /// register multiple functions that should be compared against each other during benchmarking,
     /// all taking the same arguments.
     pub fn register_many<T: Arg>(
         &self,
+        group: &str,
         f: impl RegisterMany<T>,
         args: impl IntoIterator<Item = T>,
     ) {
         let mut names = Vec::new();
         RegisterMany::push_name(&f, &mut names);
-        self.register_many_with_names(names, f, args);
+        self.register_many_with_names(group, names, f, args);
     }
 
     /// register a function for benchmarking, and the arguments that should be passed to it.
-    pub fn register<T: Arg>(&mut self, f: impl Register<T>, args: impl IntoIterator<Item = T>) {
-        self.register_many(list![f], args)
+    pub fn register<T: Arg>(
+        &self,
+        group: &str,
+        f: impl Register<T>,
+        args: impl IntoIterator<Item = T>,
+    ) {
+        self.register_many(group, list![f], args)
     }
 
     /// run the benchmark, and write the results to stdout, and optionally to a file, depending on
     /// the configuration options.
     pub fn run(&self) -> eyre::Result<BenchResult> {
         let config = &self.config;
-        let mut result = BenchResult { groups: Vec::new() };
+        let mut result = BenchResult {
+            groups: HashMap::new(),
+        };
 
         let verbose = config.verbose == StdoutPrint::Verbose;
 
         let mut plot_id = 0;
 
-        for (group, (type_id, args)) in &mut *self.groups.borrow_mut() {
+        for (group_name, (group, (type_id, args))) in &mut *self.groups.borrow_mut() {
+            if config
+                .group_filter
+                .as_ref()
+                .is_some_and(|regex| !regex.is_match(group_name))
+            {
+                continue;
+            }
+
             let mut nargs = 0;
             let mut nfuncs = 0;
             let mut max_name_len = 14;
@@ -794,6 +875,7 @@ impl Bench {
 
             if verbose {
                 let mut stdout = std::io::stdout();
+                let mut stdout = LineFormatter::new(&mut stdout, config.lines);
                 if is_plot_arg && is_not_time_metric {
                     writeln!(
                         stdout,
@@ -806,11 +888,18 @@ impl Bench {
                         "benchmark", "args", metric_name, "fastest", "median", "mean", "stddev",
                     )?;
                 } else {
+                    let len =
+                        1 + max_name_len + 1 + max_arg_len + 3 + 9 + 3 + 9 + 3 + 9 + 3 + 9 + 1;
+
+                    writeln!(stdout, "╭{:─<len$}╮", "")?;
+                    writeln!(stdout, "│{group_name:^len$}│")?;
+
                     writeln!(
                         stdout,
-                        "╭─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─╮",
+                        "├─{:─<max_name_len$}┬{:─>max_arg_len$}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┬─{:─<9}─┤",
                         "", "", "", "", "", "",
                     )?;
+
                     writeln!(
                         stdout,
                         "│ {:<max_name_len$}│{:>max_arg_len$} │ {:>9} │ {:>9} │ {:>9} │ {:>9} │",
@@ -874,6 +963,7 @@ impl Bench {
 
                 if verbose {
                     let mut stdout = std::io::stdout();
+                    let mut stdout = LineFormatter::new(&mut stdout, config.lines);
                     if is_plot_arg && is_not_time_metric {
                         writeln!(
                             stdout,
@@ -937,6 +1027,7 @@ impl Bench {
 
                     if verbose {
                         let mut stdout = std::io::stdout();
+                        let mut stdout = LineFormatter::new(&mut stdout, config.lines);
                         if is_plot_arg && is_not_time_metric {
                             writeln!(
                                     stdout,
@@ -973,7 +1064,7 @@ impl Bench {
                     }
                 }
 
-                result.groups.push(group);
+                result.groups.insert(group_name.clone(), group);
             } else {
                 let group = BenchGroupResult {
                     function: group_function_result,
@@ -981,10 +1072,11 @@ impl Bench {
                     metric_name,
                     metric_mono,
                 };
-                result.groups.push(group);
+                result.groups.insert(group_name.clone(), group);
             }
             if verbose {
                 let mut stdout = std::io::stdout();
+                let mut stdout = LineFormatter::new(&mut stdout, config.lines);
                 if is_plot_arg && is_not_time_metric {
                     writeln!(
                         stdout,
@@ -1047,6 +1139,16 @@ pub struct PlotArg(pub usize);
 /// benchmark configuration
 pub mod config {
     use super::*;
+    #[derive(
+        Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum, Serialize, Deserialize,
+    )]
+    #[clap(rename_all = "kebab_case")]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Lines {
+        No,
+        #[default]
+        Yes,
+    }
 
     impl fmt::Debug for PlotArg {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1236,9 +1338,11 @@ pub mod config {
         pub plot_metric: PlotMetric,
         pub plot_dir: PlotDir,
         pub plot_colors: PlotColors,
+        pub group_filter: Option<Regex>,
         pub func_filter: Option<Regex>,
         pub arg_filter: Option<Regex>,
         pub output: Option<PathBuf>,
+        pub lines: Lines,
     }
 
     impl BenchConfig {
@@ -1276,6 +1380,7 @@ pub mod config {
                 output: Option<PathBuf>,
                 plot_dir: Option<PathBuf>,
                 colors: Option<PlotColors>,
+                lines: Option<Lines>,
             }
 
             #[derive(Parser)]
@@ -1308,12 +1413,16 @@ pub mod config {
                 #[arg(long)]
                 quiet: bool,
 
+                /// regex to filter the benchmark groups.
+                #[arg(long, short)]
+                group_filter: Option<Regex>,
+
                 /// regex to filter the benchmark functions.
-                #[arg(long)]
+                #[arg(long, short)]
                 func_filter: Option<Regex>,
 
                 /// regex to filter the benchmark arguments.
-                #[arg(long)]
+                #[arg(long, short)]
                 arg_filter: Option<Regex>,
 
                 /// output file.
@@ -1326,6 +1435,9 @@ pub mod config {
 
                 #[arg(long)]
                 colors: Option<PlotColors>,
+
+                #[arg(long)]
+                lines: Option<Lines>,
             }
 
             let clap = Clap::parse();
@@ -1346,6 +1458,7 @@ pub mod config {
                 output: None,
                 plot_dir: None,
                 colors: None,
+                lines: None,
             });
 
             if let (Some(sample_count), _) | (None, Some(sample_count)) =
@@ -1360,7 +1473,9 @@ pub mod config {
             if let (Some(max_time), _) | (None, Some(max_time)) = (clap.max_time, toml.max_time) {
                 config.max_time = MaxTime(Duration::from_secs_f64(max_time))
             }
-            if let (Some(plot_dir), _) | (None, Some(plot_dir)) = (clap.plot_dir, toml.plot_dir) {
+            if let (Some(plot_dir), _, _) | (_, Some(plot_dir), _) | (_, _, Some(plot_dir)) =
+                (clap.plot_dir, toml.plot_dir, cargo_target_directory())
+            {
                 config.plot_dir = PlotDir(Some(plot_dir));
             }
             if clap.quiet || toml.quiet == Some(true) {
@@ -1384,6 +1499,13 @@ pub mod config {
                 };
             }
 
+            if let (Some(lines), _) | (None, Some(lines)) = (clap.lines, toml.lines) {
+                config.lines = lines;
+            }
+
+            if let Some(group_filter) = clap.group_filter {
+                config.group_filter = Some(group_filter);
+            }
             if let Some(func_filter) = clap.func_filter {
                 config.func_filter = Some(func_filter);
             }
@@ -1411,6 +1533,7 @@ pub mod config {
                         crate::PlotColors::Warm => PlotColors::Warm,
                         crate::PlotColors::Cool => PlotColors::Cool,
                     }),
+                    lines: Some(config.lines),
                 };
                 let toml = toml::ser::to_string_pretty(&toml)?;
                 std::fs::write(config_out, toml)?;
@@ -1423,6 +1546,8 @@ pub mod config {
 
 /// benchmark result output.
 pub mod result {
+    use std::collections::HashMap;
+
     pub use self::traits::Monotonicity;
 
     use super::*;
@@ -1586,11 +1711,11 @@ pub mod result {
     /// benchmark result of all groups.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct BenchResult {
-        pub groups: Vec<BenchGroupResult>,
+        pub groups: HashMap<String, BenchGroupResult>,
     }
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    pub struct Group(pub usize);
+    pub struct Group<'a>(&'a str);
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Func(pub usize);
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1635,16 +1760,9 @@ pub mod result {
         }
 
         #[cfg(feature = "plot")]
-        pub fn plot(
-            &self,
-            plot_name: &str,
-            axis: PlotAxis,
-            dir: &std::path::Path,
-        ) -> eyre::Result<()> {
+        pub fn plot_typst(&self, plot_name: &str, axis: PlotAxis) -> Option<String> {
             let group = self;
             let mut code = String::new();
-            let plot_svg = dir.join(format!("{plot_name}.svg"));
-            let plot_pdf = dir.join(format!("{plot_name}.pdf"));
 
             let mut max_y = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;
@@ -1746,10 +1864,10 @@ plot.add(
                         )
                     };
 
-                    let log = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
-                        "log"
+                    let (log, diff) = if matches!(axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
+                        ("log", f64::log2(max_y) - f64::log2(min_y))
                     } else {
-                        "lin"
+                        ("lin", max_y - min_y)
                     };
 
                     let source = format!(
@@ -1766,32 +1884,70 @@ plot.add(
 import cetz.draw: *
 import cetz-plot: *
 
-plot.plot(size: (16,8),
+plot.plot(size: (16,12),
     x-format: plot.formats.sci,
     y-format: plot.formats.sci,
-    legend: (0.5, 7.5),
-    legend-anchor: "north-west",
+    legend: (16, 0.0),
+    legend-anchor: "south-east",
     x-mode: "lin", y-mode: "{log}", y-base: 2,
     y-grid: true,
     x-min: {xmin}, x-max: {xmax},
-    y-min: {min_y} / 1.125, y-max: {max_y} * 1.125,
+    y-max: {max_y} * 1.125,
     x-ticks: ticks,
-    x-tick-step: none, y-tick-step: 1.0, y-minor-tick-step: 0.2, 
+    x-tick-step: none, y-tick-step: {diff} / 10.0, y-minor-tick-step: {diff} / 40.0, 
     x-label: "input", y-label: "{metric_name}",
 {{
     {code}
 }})
 }})
+
+{plot_name}
 ]
 "###
                     );
-                    use typst_imp::*;
-                    let (svg, pdf) = TypstCompiler::new().compile(&source).unwrap();
-                    std::fs::write(plot_svg, svg)?;
-                    std::fs::write(plot_pdf, pdf)?;
+                    Some(source)
                 }
-                _ => {}
+                _ => None,
             }
+        }
+
+        #[cfg(feature = "plot")]
+        pub fn plot(
+            &self,
+            plot_name: &str,
+            axis: PlotAxis,
+            dir: &std::path::Path,
+        ) -> eyre::Result<()> {
+            let plot_svg = dir.join(format!("{plot_name}.svg"));
+            let plot_pdf = dir.join(format!("{plot_name}.pdf"));
+
+            if let Some(source) = self.plot_typst(plot_name, axis) {
+                let svg_ok = std::process::Command::new("typst")
+                    .arg("compile")
+                    .arg("-")
+                    .arg(&plot_svg)
+                    .output()
+                    .is_ok();
+
+                let pdf_ok = std::process::Command::new("typst")
+                    .arg("compile")
+                    .arg("-")
+                    .arg(&plot_pdf)
+                    .output()
+                    .is_ok();
+
+                if !svg_ok || !pdf_ok {
+                    use typst_imp::*;
+                    let (svg, pdf) = TypstCompiler::new().compile(&source)?;
+                    if !svg_ok {
+                        std::fs::write(plot_svg, svg)?;
+                    }
+                    if !pdf_ok {
+                        std::fs::write(plot_pdf, pdf)?;
+                    }
+                }
+            }
+
             Ok(())
         }
     }
@@ -1805,50 +1961,39 @@ plot.plot(size: (16,8),
             Func(func_idx): Func,
             Arg(arg_idx): Arg,
         ) -> (&Stats<Picoseconds>, Option<&Stats<f64>>) {
-            equator::assert!(group_idx < self.groups.len());
             self.groups[group_idx].at(Func(func_idx), Arg(arg_idx))
         }
 
         pub fn combine(&self, other: &Self) -> Self {
-            BenchResult {
-                groups: core::iter::zip(&self.groups, &other.groups)
-                    .map(|(left, right)| {
-                        assert_eq!(left.args, right.args);
-                        assert_eq!(left.metric_name, right.metric_name);
-                        assert_eq!(left.metric_mono, right.metric_mono);
+            let mut out = self.clone();
 
-                        let mut set = std::collections::HashSet::new();
+            for (group, right) in &other.groups {
+                if let Some(left) = out.groups.get_mut(group) {
+                    assert_eq!(left.args, right.args);
+                    assert_eq!(left.metric_name, right.metric_name);
+                    assert_eq!(left.metric_mono, right.metric_mono);
 
-                        for f in &left.function {
-                            set.insert(&*f.name);
-                        }
-                        let mut function = left.function.clone();
-                        for f in &right.function {
-                            if !set.contains(&*f.name) {
-                                function.push(f.clone());
-                            }
-                        }
+                    let mut set = std::collections::HashSet::new();
 
-                        BenchGroupResult {
-                            function,
-                            args: left.args.clone(),
-                            metric_name: left.metric_name.clone(),
-                            metric_mono: left.metric_mono.clone(),
+                    for f in &left.function {
+                        set.insert(f.name.clone());
+                    }
+                    for f in &right.function {
+                        if !set.contains(&*f.name) {
+                            left.function.push(f.clone());
                         }
-                    })
-                    .collect(),
+                    }
+                } else {
+                    out.groups.insert(group.clone(), right.clone());
+                }
             }
+            out
         }
 
         #[cfg(feature = "plot")]
-        pub fn plot(
-            &self,
-            plot_name: &str,
-            axis: PlotAxis,
-            dir: &std::path::Path,
-        ) -> eyre::Result<()> {
-            for (plot_id, group) in self.groups.iter().enumerate() {
-                group.plot(&format!("{plot_name}_{plot_id}.svg"), axis, dir)?;
+        pub fn plot(&self, axis: PlotAxis, dir: &std::path::Path) -> eyre::Result<()> {
+            for (name, group) in self.groups.iter() {
+                group.plot(&format!("{name}"), axis, dir)?;
             }
             Ok(())
         }
@@ -1898,20 +2043,24 @@ mod tests {
     }
 
     #[test]
-    fn test_bench() {
+    fn test_bench() -> eyre::Result<()> {
         let bench = Bench::new(BenchConfig {
             plot_axis: PlotAxis::LogLog,
             min_time: MinTime(Duration::from_millis(100)),
             max_time: MaxTime(Duration::from_millis(100)),
-            arg_filter: Some(Regex::new("1").unwrap()),
-            output: cargo_target_directory().map(|x| x.join("diol.json")),
+            arg_filter: Some(Regex::new("1")?),
+            group_filter: Some(Regex::new("count")?),
+            output: cargo_target_directory().map(|dir| dir.join("output")),
+            lines: Lines::No,
             ..Default::default()
         });
         println!();
         bench.register_many(
+            "bench count ones",
             list![naive.with_name("naive loop"), popcnt],
             (0..20).map(|i| 1 << i).map(PlotArg),
         );
-        bench.run().unwrap();
+        bench.run()?;
+        Ok(())
     }
 }

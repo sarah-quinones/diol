@@ -2,8 +2,9 @@ use diol::prelude::*;
 use eyre::Result;
 
 fn main() -> Result<()> {
-    let mut bench = Bench::new(BenchConfig::from_args()?);
+    let bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
+        "slice × 2",
         list![
             // the benchmark name can be automatically deduced..
             slice_times_two,

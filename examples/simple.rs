@@ -2,8 +2,8 @@ use diol::prelude::*;
 use eyre::Result;
 
 fn main() -> Result<()> {
-    let mut bench = Bench::new(BenchConfig::from_args()?);
-    bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
+    let bench = Bench::new(BenchConfig::from_args()?);
+    bench.register("slice × 2", slice_times_two, [4, 8, 16, 128, 1024]);
     bench.run()?;
     Ok(())
 }
