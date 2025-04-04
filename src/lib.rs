@@ -16,8 +16,8 @@
 //! use diol::prelude::*;
 //!
 //! fn main() -> eyre::Result<()> {
-//!     let mut bench = Bench::new(BenchConfig::from_args()?);
-//!     bench.register(slice_times_two, [4, 8, 16, 128, 1024]);
+//!     let bench = Bench::from_args()?;
+//!     bench.register("slice×2", slice_times_two, [4, 8, 16, 128, 1024]);
 //!     bench.run()?;
 //!     Ok(())
 //! }
@@ -73,8 +73,43 @@ use result::*;
 use traits::{Arg, Register, RegisterMany};
 use variadics::{Cons, Nil};
 
-#[cfg(feature = "plot")]
+#[cfg(feature = "typst")]
 mod typst_imp;
+
+const TABLEAU10: &[(u8, u8, u8); 10] = &[
+    (0x4E, 0x79, 0xA7),
+    (0xF2, 0x8E, 0x2B),
+    (0xE1, 0x57, 0x59),
+    (0x59, 0xA1, 0x4F),
+    (0xED, 0xC9, 0x48),
+    (0xB0, 0x7A, 0xA1),
+    (0xFF, 0x9D, 0xA7),
+    (0x9C, 0x75, 0x5F),
+    (0xBA, 0xB0, 0xAC),
+    (0x76, 0xB7, 0xB2),
+];
+const TABLEAU20: &[(u8, u8, u8); 20] = &[
+    (31, 119, 180),
+    (174, 199, 232),
+    (255, 127, 14),
+    (255, 187, 120),
+    (44, 160, 44),
+    (152, 223, 138),
+    (214, 39, 40),
+    (255, 152, 150),
+    (148, 103, 189),
+    (197, 176, 213),
+    (140, 86, 75),
+    (196, 156, 148),
+    (227, 119, 194),
+    (247, 182, 210),
+    (127, 127, 127),
+    (199, 199, 199),
+    (188, 189, 34),
+    (219, 219, 141),
+    (23, 190, 207),
+    (158, 218, 229),
+];
 
 // taken from criterion
 fn cargo_target_directory() -> Option<PathBuf> {
@@ -282,7 +317,7 @@ pub mod traits {
     }
 
     /// type that can be used as a metric for plots.
-    pub trait PlotMetric: DynClone + Any {
+    pub trait PlotMetric: DynClone + Any + Send + Sync {
         fn compute(&self, arg: PlotArg, time: Picoseconds) -> f64;
         fn monotonicity(&self) -> Monotonicity;
         fn name(&self) -> &str {
@@ -290,7 +325,7 @@ pub mod traits {
         }
     }
 
-    impl<T: 'static + DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
+    impl<T: 'static + Send + Sync + DynClone + Fn(PlotArg, Picoseconds) -> f64> PlotMetric for T {
         fn monotonicity(&self) -> Monotonicity {
             Monotonicity::None
         }
@@ -1073,7 +1108,6 @@ impl Bench {
                     metric_mono,
                 };
 
-                #[cfg(feature = "plot")]
                 if is_plot_arg {
                     if let Some(plot_dir) = &config.plot_dir.0 {
                         group.plot(&format!("{group_name}"), config, plot_dir)?;
@@ -1188,6 +1222,15 @@ pub mod config {
         SemiLogY,
         #[default]
         LogLog,
+    }
+
+    impl PlotAxis {
+        pub const fn is_log_x(self) -> bool {
+            matches!(self, Self::SemiLogX | Self::LogLog)
+        }
+        pub const fn is_log_y(self) -> bool {
+            matches!(self, Self::SemiLogY | Self::LogLog)
+        }
     }
 
     /// metric to use for plots, default is time spent.
@@ -1738,8 +1781,9 @@ pub mod result {
             }
         }
 
-        #[cfg(feature = "plot")]
         pub fn plot_typst(&self, plot_name: &str, config: &Config) -> Option<String> {
+            use average::{Estimate, Quantile};
+
             let group = self;
             let mut code = String::new();
 
@@ -1766,30 +1810,40 @@ pub mod result {
 
                         for (arg_idx, (keep, arg)) in args.iter_mut().enumerate() {
                             let metric = &*f.metric.as_ref().unwrap()[arg_idx];
-                            let (mean, mut stddev) =
-                                result::Stats::from_slice(&metric).mean_stddev();
-                            if stddev.is_nan() {
-                                stddev = 0.0;
-                            }
+                            let mut q0 = Quantile::new(0.1);
+                            let mut q1 = Quantile::new(0.25);
+                            let mut q2 = Quantile::new(0.5);
+                            let mut q3 = Quantile::new(0.75);
+                            let mut q4 = Quantile::new(0.9);
 
-                            if mean.is_finite() {
-                                max_y = f64::max(max_y, mean + 3.0 * stddev);
-                                min_y = f64::min(min_y, mean - 3.0 * stddev);
+                            for &m in metric {
+                                q0.add(m);
+                                q1.add(m);
+                                q2.add(m);
+                                q3.add(m);
+                                q4.add(m);
+                            }
+                            let q0 = q0.estimate();
+                            let q1 = q1.estimate();
+                            let q2 = q2.estimate();
+                            let q3 = q3.estimate();
+                            let q4 = q4.estimate();
+
+                            if q2.is_finite() {
+                                max_y = f64::max(max_y, q4);
+                                min_y = f64::min(min_y, q0);
 
                                 *keep = true;
-                                let arg = if matches!(
-                                    config.plot_axis,
-                                    PlotAxis::LogLog | PlotAxis::SemiLogX
-                                ) {
+                                let arg = if config.plot_axis.is_log_x() {
                                     (*arg).log2()
                                 } else {
                                     *arg
                                 };
-                                line += &format!("({arg}, {mean}),");
-                                lower1 += &format!("({arg}, {}),", mean - 1.0 * stddev);
-                                upper1 += &format!("({arg}, {}),", mean + 1.0 * stddev);
-                                lower2 += &format!("({arg}, {}),", mean - 2.0 * stddev);
-                                upper2 += &format!("({arg}, {}),", mean + 2.0 * stddev);
+                                lower2 += &format!("({arg}, {q0}),");
+                                lower1 += &format!("({arg}, {q1}),");
+                                line += &format!("({arg}, {q2}),");
+                                upper1 += &format!("({arg}, {q3}),");
+                                upper2 += &format!("({arg}, {q4}),");
                             }
                         }
                         if !line.is_empty() {
@@ -1819,40 +1873,8 @@ pub mod result {
                                 PlotColors::Cividis => from_colorgrad(colorgrad::cividis()),
                                 PlotColors::Warm => from_colorgrad(colorgrad::warm()),
                                 PlotColors::Cool => from_colorgrad(colorgrad::cool()),
-                                PlotColors::Tableau20 => [
-                                    (31, 119, 180),
-                                    (174, 199, 232),
-                                    (255, 127, 14),
-                                    (255, 187, 120),
-                                    (44, 160, 44),
-                                    (152, 223, 138),
-                                    (214, 39, 40),
-                                    (255, 152, 150),
-                                    (148, 103, 189),
-                                    (197, 176, 213),
-                                    (140, 86, 75),
-                                    (196, 156, 148),
-                                    (227, 119, 194),
-                                    (247, 182, 210),
-                                    (127, 127, 127),
-                                    (199, 199, 199),
-                                    (188, 189, 34),
-                                    (219, 219, 141),
-                                    (23, 190, 207),
-                                    (158, 218, 229),
-                                ][idx % 20],
-                                PlotColors::Tableau10 => [
-                                    (0x4E, 0x79, 0xA7),
-                                    (0xF2, 0x8E, 0x2B),
-                                    (0xE1, 0x57, 0x59),
-                                    (0x59, 0xA1, 0x4F),
-                                    (0xED, 0xC9, 0x48),
-                                    (0xB0, 0x7A, 0xA1),
-                                    (0xFF, 0x9D, 0xA7),
-                                    (0x9C, 0x75, 0x5F),
-                                    (0xBA, 0xB0, 0xAC),
-                                    (0x76, 0xB7, 0xB2),
-                                ][idx % 10],
+                                PlotColors::Tableau20 => TABLEAU20[idx % 20],
+                                PlotColors::Tableau10 => TABLEAU10[idx % 10],
                             };
 
                             let color = format!("rgb(\"#{r:02x}{g:02x}{b:02x}\")");
@@ -1918,10 +1940,7 @@ plot.add-fill-between(
                     let xmin = args[0];
                     let xmax = *args.last().unwrap();
 
-                    let (xmin, xmax, ticks) = if matches!(
-                        config.plot_axis,
-                        PlotAxis::LogLog | PlotAxis::SemiLogX
-                    ) {
+                    let (xmin, xmax, ticks) = if config.plot_axis.is_log_x() {
                         (
                             xmin.log2(),
                             xmax.log2(),
@@ -1934,13 +1953,22 @@ plot.add-fill-between(
                             format!("#let ticks = ({ticks},).map((i) => (i, rotate(-45deg, reflow: true)[#i]));"),
                         )
                     };
+                    min_y = f64::max(min_y, 0.0);
+                    max_y = f64::max(max_y, min_y);
 
-                    let (log, diff) =
-                        if matches!(config.plot_axis, PlotAxis::LogLog | PlotAxis::SemiLogY) {
-                            ("log", f64::log2(max_y) - f64::log2(min_y))
-                        } else {
-                            ("lin", max_y - min_y)
-                        };
+                    max_y *= 1.125;
+                    min_y /= 1.125;
+
+                    let (log, diff, minor_ticks, min_y) = if config.plot_axis.is_log_y() {
+                        ("log", f64::log2(max_y) - f64::log2(min_y), 0.2, min_y)
+                    } else {
+                        (
+                            "lin",
+                            max_y - min_y,
+                            (max_y - min_y) / 30.0,
+                            f64::min(min_y, 0.0),
+                        )
+                    };
 
                     let source = format!(
                         r###"
@@ -1962,9 +1990,10 @@ plot.plot(size: (16,12),
     x-mode: "lin", y-mode: "{log}", y-base: 2,
     y-grid: true,
     x-min: {xmin}, x-max: {xmax},
-    y-max: {max_y} * 1.125,
+    y-max: {max_y},
+    y-min: {min_y},
     x-ticks: ticks,
-    x-tick-step: none, y-tick-step: {diff} / 10.0, y-minor-tick-step: 0.2, 
+    x-tick-step: none, y-tick-step: {diff} / 10.0, y-minor-tick-step: {minor_ticks}, 
     x-label: "input", y-label: "{metric_name}",
 {{
     {code}
@@ -1981,7 +2010,6 @@ plot.plot(size: (16,12),
             }
         }
 
-        #[cfg(feature = "plot")]
         pub fn plot(
             &self,
             plot_name: &str,
@@ -1994,7 +2022,25 @@ plot.plot(size: (16,12),
             let plot_pdf = dir.join(format!("{plot_name}.pdf"));
 
             if let Some(source) = self.plot_typst(plot_name, config) {
-                let source_raw = typst_imp::templates::raw(&source);
+                if !std::process::Command::new("typst")
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .status()?
+                    .success()
+                {
+                    return Err(eyre::Report::msg("could not find typst binary"));
+                }
+
+                let source_raw = {
+                    let code: &str = &source;
+                    format!(
+                        r#"
+#set page(height: auto, width: auto, margin: 5pt, fill: none)
+#set text(16pt)
+{code}
+"#,
+                    )
+                };
                 let mut svg = std::process::Command::new("typst")
                     .arg("compile")
                     .arg("-")
@@ -2019,15 +2065,25 @@ plot.plot(size: (16,12),
                     .write_all(source_raw.as_bytes())?;
                 let pdf_ok = pdf.wait_with_output().is_ok();
 
+                #[cfg(feature = "typst")]
                 if !svg_ok || !pdf_ok {
                     use typst_imp::*;
-                    let (svg, pdf) = TypstCompiler::new().compile(&source)?;
+                    let (svg, pdf) = match TypstCompiler::new().compile(&source) {
+                        Ok(out) => out,
+                        Err(_) => {
+                            return Err(eyre::Report::msg("invalid typst input"));
+                        }
+                    };
                     if !svg_ok {
                         std::fs::write(plot_svg, svg)?;
                     }
                     if !pdf_ok {
                         std::fs::write(plot_pdf, pdf)?;
                     }
+                }
+                #[cfg(not(feature = "typst"))]
+                if !svg_ok || !pdf_ok {
+                    return Err(eyre::Report::msg("invalid typst input"));
                 }
             }
 
@@ -2073,7 +2129,6 @@ plot.plot(size: (16,12),
             out
         }
 
-        #[cfg(feature = "plot")]
         pub fn plot(&self, config: &Config, dir: &std::path::Path) -> eyre::Result<()> {
             for (name, group) in self.groups.iter() {
                 group.plot(&format!("{name}"), config, dir)?;

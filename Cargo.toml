@@ -14,7 +14,6 @@ clap = { version = "4.5.4", features = ["derive"] }
 colorgrad = "0.6.2"
 dyn-clone = "1.0.17"
 equator = "0.2.0"
-plotters = { version = "0.3.5", optional = true }
 prettyplease = "0.2.19"
 quote = "1.0.36"
 regex = "1.10.4"
@@ -33,10 +32,11 @@ typst = { version = "0.13.1", optional = true }
 typst-pdf = { version = "0.13.1", optional = true }
 typst-svg = { version = "0.13.1", optional = true }
 ttf-parser = { version = "0.25.1", optional = true }
+average = "0.16.0"
 
 [features]
-default = ["plot"]
-plot = [
+default = []
+typst = [
   "dep:reqwest",
   "dep:time",
   "dep:typst-assets",
