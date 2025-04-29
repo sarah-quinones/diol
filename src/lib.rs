@@ -1930,6 +1930,9 @@ plot.add-fill-between(
                         .filter(|(keep, _)| *keep)
                         .map(|(_, arg)| *arg)
                         .collect::<Vec<_>>();
+                    if args.is_empty() {
+                        return None;
+                    }
 
                     let ticks = args
                         .iter()
